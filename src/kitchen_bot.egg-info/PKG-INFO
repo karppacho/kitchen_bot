@@ -1,0 +1,13 @@
+Metadata-Version: 2.4
+Name: kitchen-bot
+Version: 0.1.0
+Summary: AI-ассистент R&D кухни (MVP)
+Requires-Python: >=3.11
+Requires-Dist: aiogram>=3.4
+Requires-Dist: openai>=1.40
+Requires-Dist: gspread>=6.0
+Requires-Dist: google-auth>=2.0
+Requires-Dist: pydantic>=2.0
+Requires-Dist: pydantic-settings>=2.0
+Requires-Dist: loguru>=0.7
+Requires-Dist: python-dotenv>=1.0

@@ -1,0 +1,24 @@
+# Секреты — никогда не коммитим
+.env
+google_credentials.json
+*.json
+!pyproject.toml
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+.python-version
+
+# Логи
+logs/
+*.log
+
+# IDE
+.vscode/
+.idea/
+
+TZ_kitchen_assistant_v4_full.md
+TTK_template.docx
+CLAUDE.md

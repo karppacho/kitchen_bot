@@ -1,0 +1,22 @@
+[project]
+name = "kitchen-bot"
+version = "0.1.0"
+description = "AI-ассистент R&D кухни (MVP)"
+requires-python = ">=3.11"
+dependencies = [
+    "aiogram>=3.4",
+    "openai>=1.40",
+    "gspread>=6.0",
+    "google-auth>=2.0",
+    "pydantic>=2.0",
+    "pydantic-settings>=2.0",
+    "loguru>=0.7",
+    "python-dotenv>=1.0",
+    "docxtpl>=0.16",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.1",
+]
