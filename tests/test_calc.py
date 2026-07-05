@@ -280,6 +280,85 @@ def test_replacement_real():
     assert dish["new_uc"] == 25.57                # 8.57 + 5.00 + 12.00
 
 
+# ---------- Неполные данные: ингредиент остаётся в составе с cost=0 ----------
+
+def test_ingredient_without_price_stays_in_output():
+    """Нет цены → стоимость 0, но вес входит в выход, КБЖУ и рецептуру ТТК."""
+    d = make_data()
+    d.ingredients[3].price_per_unit = None        # салат без цены
+    r = calculate_dish_uc(d, "T001")
+    assert r.output_grams == Decimal("160")       # выход не занижен
+    salad = next(i for i in r.ingredients if i.name == "Салат")
+    assert salad.cost_rub == Decimal("0")
+    assert r.uc_rub == Decimal("20.57")           # 8.57 + 0 + 12.00
+    assert r.kcal == Decimal("200")               # КБЖУ салата всё ещё учтено
+    assert any("нет цены" in w for w in r.warnings)
+
+
+def test_piece_without_weight_stays_in_output():
+    """Штучный без «Вес 1 шт» → стоимость 0, но вес в выходе и составе."""
+    d = make_data()
+    d.ingredients[1].weight_per_unit_g = None     # тортилья без веса 1 шт
+    r = calculate_dish_uc(d, "T001")
+    assert r.output_grams == Decimal("160")
+    tort = next(i for i in r.ingredients if i.name == "Тортилья")
+    assert tort.cost_rub == Decimal("0")
+    assert r.uc_rub == Decimal("62.00")           # 0 + 50.00 + 12.00
+    assert any("вес 1 шт" in w for w in r.warnings)
+
+
+def test_simulate_zero_price_error():
+    """Цена 0 в таблице → внятная ошибка вместо деления на ноль."""
+    d = make_data()
+    d.ingredients[3].price_per_unit = Decimal("0")
+    r = simulate_price_change(d, 3, multiplier=Decimal("2"))
+    assert "error" in r
+    assert "нулевая цена" in r["error"]
+
+
+# ---------- Разбиение длинных ответов под лимит Telegram ----------
+
+def test_split_short_text_untouched():
+    from src.bot.telegram_text import split_for_telegram
+    assert split_for_telegram("привет") == ["привет"]
+
+
+def test_split_long_text_chunks():
+    from src.bot.telegram_text import split_for_telegram, TELEGRAM_MAX_LEN
+    text = "\n".join(f"строка номер {i}" for i in range(1000))
+    chunks = split_for_telegram(text)
+    assert len(chunks) > 1
+    assert all(len(c) <= TELEGRAM_MAX_LEN for c in chunks)
+    # Контент не потерялся (переносы на стыках кусков съедаются)
+    assert "".join(chunks).replace("\n", "") == text.replace("\n", "")
+
+
+def test_split_keeps_pre_balanced():
+    from src.bot.telegram_text import split_for_telegram, TELEGRAM_MAX_LEN
+    rows = "\n".join(f"позиция {i}  100 г  10.00 ₽" for i in range(500))
+    text = "Шапка\n<pre>\n" + rows + "\n</pre>\nПодвал"
+    chunks = split_for_telegram(text)
+    assert len(chunks) > 1
+    for c in chunks:
+        assert len(c) <= TELEGRAM_MAX_LEN
+        assert c.count("<pre>") == c.count("</pre>")  # каждый кусок — валидный HTML
+
+
+# ---------- Конфиг: TELEGRAM_ALLOWED_USER_IDS в двух форматах ----------
+
+def test_config_user_ids_comma_and_json():
+    """Формат из README ("123,456") и JSON ("[123,456]") оба валидны."""
+    from src.config import Settings
+    base = dict(
+        google_sheets_id="x", google_service_account_json_path="x",
+        polza_api_key="x", telegram_bot_token="x",
+    )
+    s = Settings(telegram_allowed_user_ids="123, 456", **base)
+    assert s.telegram_allowed_user_ids == [123, 456]
+    s = Settings(telegram_allowed_user_ids="[123,456]", **base)
+    assert s.telegram_allowed_user_ids == [123, 456]
+
+
 # ---------- Запуск без pytest ----------
 
 def _run_all():

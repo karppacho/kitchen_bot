@@ -35,7 +35,10 @@ def print_dish_full(data, dish_id):
     if main_items:
         print("\nСостав:")
         for it in main_items:
-            unit_info = f"{float(it.price_per_unit):>8.2f} ₽/{it.unit}"
+            if it.price_per_unit is not None:
+                unit_info = f"{float(it.price_per_unit):>8.2f} ₽/{it.unit}"
+            else:
+                unit_info = f"{'нет цены':>8} ₽/{it.unit}"
             if it.unit == "шт" and it.weight_per_piece_g:
                 unit_info += f" ({int(it.weight_per_piece_g)} г/шт)"
             share = f"{float(it.share_percent):>5.1f}%" if it.share_percent else "   -  "

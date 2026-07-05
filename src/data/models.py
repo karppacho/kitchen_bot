@@ -96,7 +96,7 @@ class DishIngredientCost(BaseModel):
     weight_g: Decimal  # нетто
     weight_brutto_g: Decimal | None = None  # брутto (с учётом потерь), для рецептуры ТТК
     unit: str = "кг"
-    price_per_unit: Decimal
+    price_per_unit: Decimal | None = None  # None — цены нет в ING (cost_rub тогда 0)
     weight_per_piece_g: Decimal | None = None
     cost_rub: Decimal
     row_type: str

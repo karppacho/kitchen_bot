@@ -13,6 +13,7 @@ from loguru import logger
 from src.config import settings
 from src.llm.client import chat
 from src.llm.history import clear as clear_history
+from src.bot.telegram_text import split_for_telegram
 from src.data.sheets import get_data, reload_data
 
 # parse_mode=HTML: числовые ответы приходят с таблицей в <pre> (моноширинный шрифт,
@@ -26,6 +27,21 @@ dp = Dispatcher()
 
 def _is_authorized(user_id: int) -> bool:
     return user_id in settings.telegram_allowed_user_ids
+
+
+async def _send_long(message: Message, text: str) -> None:
+    """Отправка ответа с учётом лимита Telegram (4096 символов на сообщение).
+
+    Длинный текст режется по границам строк (таблицы <pre> не ломаются).
+    Если Telegram не принял HTML — кусок уходит плоским текстом, чтобы шеф
+    хоть что-то получил вместо молчания.
+    """
+    for chunk in split_for_telegram(text):
+        try:
+            await message.answer(chunk)
+        except TelegramBadRequest:
+            logger.warning("HTML parse не прошёл, отправляю плоским текстом")
+            await message.answer(chunk, parse_mode=None)
 
 
 @dp.message(Command("start"))
@@ -70,7 +86,9 @@ async def cmd_refresh(message: Message):
         return
     await message.answer("Перечитываю таблицу...")
     try:
-        reload_data()
+        # В поток: синхронный gspread иначе блокирует event loop на всё время чтения
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, reload_data)
         data = get_data()
         await message.answer(
             f"Обновлено. Сейчас в базе:\n"
@@ -109,13 +127,7 @@ async def on_text(message: Message):
         reply = f"Что-то пошло не так: {e}"
 
     logger.info(f"[{user_id} {user_name}] <<< {reply[:300]}")
-    try:
-        await message.answer(reply)
-    except TelegramBadRequest:
-        # Невалидный HTML в свободном тексте модели — шлём как обычный текст,
-        # чтобы шеф хоть что-то получил вместо молчания.
-        logger.warning("HTML parse не прошёл, отправляю плоским текстом")
-        await message.answer(reply, parse_mode=None)
+    await _send_long(message, reply)
 
     # Сгенерированные файлы (например, .docx ТТК) — отправляем документами
     for path in files:

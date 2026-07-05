@@ -36,10 +36,12 @@ from src.calc.costs import (
 from src.ttk.builder import build_ttk_context, render_ttk
 from src.llm.history import get_history, append_turn
 
-# Один клиент на весь процесс
+# Один клиент на весь процесс. timeout: иначе зависший запрос к polza.ai
+# держит поток (и «печатает…» у шефа) до 10 минут — дефолта SDK.
 client = OpenAI(
     base_url=settings.polza_base_url,
     api_key=settings.polza_api_key,
+    timeout=60.0,
 )
 
 # Промпты — читаем из файлов, не из кода
@@ -153,7 +155,7 @@ def _resolve_dish_filter(data, dish_arg: str, ing):
 def _tool_calculate_dish_uc(args: dict) -> dict:
     """Вызов calculate_dish_uc → красивый JSON-результат."""
     data = get_data()
-    query = args.get("dish_name_or_id", "").strip()
+    query = (args.get("dish_name_or_id") or "").strip()
     if not query:
         return {"error": "Не указано название или ID блюда"}
 
@@ -198,7 +200,10 @@ def _tool_calculate_dish_uc(args: dict) -> dict:
                 "name": ing.name,
                 "weight_g": float(ing.weight_g),
                 "unit": ing.unit,
-                "price_per_unit_rub": float(ing.price_per_unit),
+                "price_per_unit_rub": (
+                    float(ing.price_per_unit)
+                    if ing.price_per_unit is not None else None
+                ),
                 "weight_per_piece_g": (
                     float(ing.weight_per_piece_g)
                     if ing.weight_per_piece_g is not None else None
@@ -220,7 +225,7 @@ def _tool_calculate_dish_uc(args: dict) -> dict:
 
 def _tool_list_dishes(args: dict) -> dict:
     data = get_data()
-    category = args.get("category", "").strip().lower()
+    category = (args.get("category") or "").strip().lower()
     only_with_composition = bool(args.get("only_with_composition"))
 
     dishes = list(data.dishes.values())
@@ -252,7 +257,7 @@ def _tool_list_dishes(args: dict) -> dict:
 
 def _tool_find_dishes_with_ingredient(args: dict) -> dict:
     data = get_data()
-    query = args.get("ingredient_name", "").strip()
+    query = (args.get("ingredient_name") or "").strip()
     if not query:
         return {"error": "Не указано название ингредиента"}
 
@@ -273,9 +278,9 @@ def _tool_find_dishes_with_ingredient(args: dict) -> dict:
 
 def _tool_compare_dishes_margin(args: dict) -> dict:
     data = get_data()
-    category = args.get("category", "").strip().lower()
-    sort_by = args.get("sort_by", "margin_percent")
-    order = args.get("order", "desc")
+    category = (args.get("category") or "").strip().lower()
+    sort_by = args.get("sort_by") or "margin_percent"
+    order = args.get("order") or "desc"
 
     dishes_to_compare = list(data.dishes.values())
     if category:
@@ -332,7 +337,7 @@ def _tool_reload_database(args: dict) -> dict:
 
 def _tool_simulate_price_change(args: dict) -> dict:
     data = get_data()
-    query = args.get("ingredient_name", "").strip()
+    query = (args.get("ingredient_name") or "").strip()
     if not query:
         return {"error": "Не указано название ингредиента"}
 
@@ -380,10 +385,10 @@ def _tool_simulate_price_change(args: dict) -> dict:
 
 def _tool_simulate_replacement(args: dict) -> dict:
     data = get_data()
-    old_q = args.get("old_ingredient_name", "").strip()
+    old_q = (args.get("old_ingredient_name") or "").strip()
     if not old_q:
         return {"error": "Не указан исходный ингредиент (old_ingredient_name)"}
-    new_q = args.get("new_ingredient_name", "").strip()
+    new_q = (args.get("new_ingredient_name") or "").strip()
     new_price_raw = args.get("new_price")
     if not new_q and new_price_raw is None:
         return {
@@ -452,8 +457,8 @@ def _tool_list_ingredients(args: dict) -> dict:
     Для запросов «какие у нас соусы», «покажи сыры», «что есть из моцареллы».
     """
     data = get_data()
-    category = args.get("category", "").strip()
-    query = args.get("query", "").strip()
+    category = (args.get("category") or "").strip()
+    query = (args.get("query") or "").strip()
 
     if category:
         ings = data.list_ingredients_by_category(category)
@@ -520,7 +525,7 @@ def _generate_organoleptic(dish_name: str, ingredients_str: str, tech_hint: str)
 
 def _tool_generate_ttk_document(args: dict) -> dict:
     data = get_data()
-    query = args.get("dish_name_or_id", "").strip()
+    query = (args.get("dish_name_or_id") or "").strip()
     if not query:
         return {"error": "Не указано блюдо для ТТК"}
 
@@ -555,7 +560,7 @@ def _tool_generate_ttk_document(args: dict) -> dict:
     if not bool(args.get("confirm")):
         return {"display": format_ttk_preview(context, meta)}
 
-    tech_hint = args.get("tech_process_hint", "").strip()
+    tech_hint = (args.get("tech_process_hint") or "").strip()
     ingredients_str = ", ".join(f"{i['name']} {i['netto']} г" for i in meta["ingredients"])
     try:
         context["tech_process"] = _generate_tech_process(
@@ -742,6 +747,18 @@ def _tool_create_dish(args: dict) -> dict:
         ))
 
     uc = calculate_uc_for_composition(data, new_id, name, price_menu, rows)
+
+    # Дубль по названию не блокируем (решает шеф), но честно предупреждаем в превью
+    warnings = list(uc.warnings)
+    dup = next(
+        (d for d in data.dishes.values() if d.name.lower() == name.lower()), None
+    )
+    if dup is not None:
+        warnings.append(
+            f"Блюдо с таким названием уже есть в базе ({dup.id}) — "
+            f"получится дубль по имени"
+        )
+
     result = {
         "dish_id": new_id,
         "dish_name": name,
@@ -769,7 +786,7 @@ def _tool_create_dish(args: dict) -> dict:
             }
             for i in uc.ingredients
         ],
-        "warnings": uc.warnings,
+        "warnings": warnings,
     }
 
     if not confirm:

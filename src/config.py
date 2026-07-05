@@ -1,5 +1,9 @@
 """Конфигурация — все настройки из .env."""
-from pydantic_settings import BaseSettings, SettingsConfigDict
+import json
+from typing import Annotated
+
+from pydantic import field_validator
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 
 
 class Settings(BaseSettings):
@@ -14,7 +18,19 @@ class Settings(BaseSettings):
 
     # Telegram
     telegram_bot_token: str
-    telegram_allowed_user_ids: list[int]
+    # NoDecode: иначе pydantic-settings требует JSON и падает на формате из README
+    telegram_allowed_user_ids: Annotated[list[int], NoDecode]
+
+    @field_validator("telegram_allowed_user_ids", mode="before")
+    @classmethod
+    def _parse_user_ids(cls, v):
+        """Список ID из .env: и "123,456" (формат README), и JSON "[123,456]"."""
+        if isinstance(v, str):
+            s = v.strip()
+            if s.startswith("["):
+                return json.loads(s)
+            return [int(x) for x in s.split(",") if x.strip()]
+        return v
 
     # Реквизиты для официальной ТТК (.docx). Дефолты — текущая сеть «Тим Кук».
     # При масштабировании на другие сети переопределяются через .env.
@@ -25,7 +41,6 @@ class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",
-        # Список читаем из строки "123,456" → [123, 456]
         env_parse_none_str="None",
     )
 

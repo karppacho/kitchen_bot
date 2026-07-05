@@ -556,8 +556,14 @@ def get_data() -> KitchenData:
 
 
 def reload_data() -> KitchenData:
-    """Принудительная перезагрузка из Sheets (например, по команде /refresh)."""
+    """Принудительная перезагрузка из Sheets (например, по команде /refresh).
+
+    Глобал подменяется только ПОСЛЕ полной загрузки: параллельные запросы всё
+    время видят целый кеш (старый или новый), а при ошибке загрузки старый
+    кеш остаётся рабочим.
+    """
     global _data
-    _data = KitchenData()
-    _data.load_all()
+    new_data = KitchenData()
+    new_data.load_all()
+    _data = new_data
     return _data

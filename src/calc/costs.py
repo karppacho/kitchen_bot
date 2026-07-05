@@ -160,19 +160,23 @@ def _compute_uc(
                     f"Ингредиент id={eff_id} не найден в ING"
                 )
                 continue
+            # Нет цены (или веса 1 шт у штучного) — стоимость посчитать нельзя,
+            # но ингредиент остаётся в составе с cost=0: его вес входит в выход
+            # блюда, КБЖУ и рецептуру ТТК. Иначе официальная карта молча
+            # получалась бы неполной, а выход — заниженным.
             if ing.price_per_unit is None:
                 warnings.append(
-                    f"У ингредиента «{ing.name}» нет цены — пропустил в расчёте"
+                    f"У ингредиента «{ing.name}» нет цены — в UC не учтён (стоимость 0)"
                 )
-                continue
-            # Дополнительно для штучных: нужен вес 1 шт
-            if ing.unit == "шт" and (not ing.weight_per_unit_g or ing.weight_per_unit_g == 0):
+                cost = Decimal("0")
+            elif ing.unit == "шт" and (not ing.weight_per_unit_g or ing.weight_per_unit_g == 0):
                 warnings.append(
-                    f"У штучного ингредиента «{ing.name}» не указан вес 1 шт — пропустил"
+                    f"У штучного ингредиента «{ing.name}» не указан вес 1 шт — "
+                    f"в UC не учтён (стоимость 0)"
                 )
-                continue
-
-            cost = calculate_ingredient_cost_in_dish(ing, row.weight_neto_g)
+                cost = Decimal("0")
+            else:
+                cost = calculate_ingredient_cost_in_dish(ing, row.weight_neto_g)
             items.append(
                 DishIngredientCost(
                     name=ing.name,
@@ -360,6 +364,13 @@ def simulate_price_change(
     old_price = ing.price_per_unit
     if old_price is None:
         return {"error": f"У ингредиента '{ing.name}' нет текущей цены"}
+    if old_price == 0:
+        return {
+            "error": (
+                f"У ингредиента '{ing.name}' нулевая цена — симуляция изменения "
+                f"от нуля не имеет смысла. Проверь цену в ING."
+            )
+        }
 
     # Резолвим новую цену из одного из способов
     provided = [x for x in (new_price, delta_rub, multiplier) if x is not None]
@@ -390,38 +401,40 @@ def simulate_price_change(
             "dishes": [],
         }
 
-    # Считаем UC до и после. Цену в кеше подменяем временно — try/finally
-    # гарантирует, что при любой ошибке исходная цена восстановится и кеш
-    # не останется испорченным.
-    results = []
-    try:
-        for dish in affected:
-            ing.price_per_unit = old_price
-            old_uc = calculate_dish_uc(data, dish.id)
-            if old_uc is None:
-                continue
-            ing.price_per_unit = new_price_per_unit
-            new_uc = calculate_dish_uc(data, dish.id)
-            if new_uc is None:
-                continue
+    # Считаем UC до и после. Общий кеш НЕ мутируем (запросы идут в параллельных
+    # потоках): новая цена живёт в копии ингредиента внутри «виртуальной» базы,
+    # которая разделяет с кешем всё, кроме словаря ингредиентов.
+    sim_ing = ing.model_copy(update={"price_per_unit": new_price_per_unit})
+    sim = KitchenData()
+    sim.ingredients = {**data.ingredients, ingredient_id: sim_ing}
+    sim.packagings = data.packagings
+    sim.dishes = data.dishes
+    sim.ttk_by_dish = data.ttk_by_dish
+    sim.cooking_methods = data.cooking_methods
 
-            delta_uc = float(new_uc.uc_rub - old_uc.uc_rub)
-            results.append({
-                "dish_id": dish.id,
-                "dish_name": dish.name,
-                "price_menu": float(dish.price_menu),
-                "old_uc": float(old_uc.uc_rub),
-                "new_uc": float(new_uc.uc_rub),
-                "delta_uc": round(delta_uc, 2),
-                "old_margin_percent": float(old_uc.margin_percent),
-                "new_margin_percent": float(new_uc.margin_percent),
-                "delta_margin_percent": round(
-                    float(new_uc.margin_percent - old_uc.margin_percent), 1
-                ),
-            })
-    finally:
-        # Всегда возвращаем исходную цену в кеш
-        ing.price_per_unit = old_price
+    results = []
+    for dish in affected:
+        old_uc = calculate_dish_uc(data, dish.id)
+        if old_uc is None:
+            continue
+        new_uc = calculate_dish_uc(sim, dish.id)
+        if new_uc is None:
+            continue
+
+        delta_uc = float(new_uc.uc_rub - old_uc.uc_rub)
+        results.append({
+            "dish_id": dish.id,
+            "dish_name": dish.name,
+            "price_menu": float(dish.price_menu),
+            "old_uc": float(old_uc.uc_rub),
+            "new_uc": float(new_uc.uc_rub),
+            "delta_uc": round(delta_uc, 2),
+            "old_margin_percent": float(old_uc.margin_percent),
+            "new_margin_percent": float(new_uc.margin_percent),
+            "delta_margin_percent": round(
+                float(new_uc.margin_percent - old_uc.margin_percent), 1
+            ),
+        })
 
     return {
         "ingredient": ing.name,
