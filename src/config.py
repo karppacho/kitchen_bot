@@ -38,6 +38,17 @@ class Settings(BaseSettings):
     ttk_director_position: str = "Генеральный директор"
     ttk_tr_ts_number: str = "021/2011"
 
+    # Мониторинг конкурентов (src/competitors/)
+    competitors_sheets_id: str | None = None       # None → экспорт в Sheets выключен
+    competitors_db_path: str = "data/competitors.db"
+    competitors_check_day: str = "mon"             # ночь вс→пн; день/время уточнить с шефом
+    competitors_check_hour: int = 3
+    competitors_check_minute: int = 30
+    # Порог существенного изменения цены: max(pct% от старой цены, rub)
+    competitors_price_threshold_pct: float = 10.0
+    competitors_price_threshold_rub: float = 30.0
+    competitors_llm_model: str | None = None       # None → llm_model
+
     model_config = SettingsConfigDict(
         env_file=".env",
         env_file_encoding="utf-8",

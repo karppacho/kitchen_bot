@@ -13,7 +13,9 @@ from loguru import logger
 from src.config import settings
 from src.llm.client import chat
 from src.llm.history import clear as clear_history
+from src.bot.competitors import register as register_competitors
 from src.bot.telegram_text import split_for_telegram
+from src.competitors.service import run_check as run_competitors_check
 from src.data.sheets import get_data, reload_data
 
 # parse_mode=HTML: числовые ответы приходят с таблицей в <pre> (моноширинный шрифт,
@@ -63,7 +65,15 @@ async def cmd_start(message: Message):
         "Команды:\n"
         "/refresh — перечитать таблицу после изменений\n"
         "/new — начать новый диалог (сбросить контекст)\n"
-        "/help — это сообщение"
+        "/help — это сообщение\n\n"
+        "Мониторинг конкурентов (раз в неделю автоматически):\n"
+        "/list_competitors — кого отслеживаем\n"
+        "/add_competitor <url> [название] — добавить сайт\n"
+        "/remove_competitor <url> — убрать сайт\n"
+        "/check_competitors — проверить прямо сейчас\n"
+        "/competitors_report — отчёт в Google Sheets\n"
+        "Если сайт не пускает бота — сохрани страницу меню (Ctrl+S) "
+        "и пришли файл с подписью-названием конкурента."
     )
 
 
@@ -100,6 +110,11 @@ async def cmd_refresh(message: Message):
     except Exception as e:
         logger.exception("Ошибка перезагрузки данных")
         await message.answer(f"Ошибка при чтении таблицы: {e}")
+
+
+# Команды мониторинга конкурентов. СТРОГО до on_text: Dispatcher проверяет свои
+# хендлеры в порядке регистрации, catch-all F.text иначе перехватит команды.
+register_competitors(dp)
 
 
 @dp.message(F.text)
@@ -158,6 +173,31 @@ async def main():
     except Exception as e:
         logger.exception(f"Не удалось загрузить данные: {e}")
         raise
+
+    # Еженедельная проверка конкурентов — в этом же процессе, рядом с polling
+    from apscheduler.schedulers.asyncio import AsyncIOScheduler
+    from apscheduler.triggers.cron import CronTrigger
+
+    async def _weekly_competitors_check():
+        try:
+            await run_competitors_check(bot, trigger="cron")
+        except Exception:
+            logger.exception("Еженедельная проверка конкурентов упала")
+
+    scheduler = AsyncIOScheduler(timezone="Europe/Moscow")
+    scheduler.add_job(
+        _weekly_competitors_check,
+        CronTrigger(
+            day_of_week=settings.competitors_check_day,
+            hour=settings.competitors_check_hour,
+            minute=settings.competitors_check_minute,
+        ),
+    )
+    scheduler.start()
+    logger.info(
+        f"Мониторинг конкурентов: {settings.competitors_check_day} "
+        f"{settings.competitors_check_hour:02d}:{settings.competitors_check_minute:02d} МСК"
+    )
 
     logger.info(f"Бот стартует. Модель: {settings.llm_model}")
     await dp.start_polling(bot)
