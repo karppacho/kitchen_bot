@@ -27,6 +27,32 @@ def _round_percent(value: Decimal) -> Decimal:
     return value.quantize(Decimal("0.1"), rounding=ROUND_HALF_UP)
 
 
+def opt_float(value: Decimal | None) -> float | None:
+    """Decimal → float, None остаётся None (цена меню/маржа могут быть не заполнены)."""
+    return float(value) if value is not None else None
+
+
+def _margin_delta_fields(old: DishUCResult, new: DishUCResult) -> dict:
+    """Поля «маржа была → стала» для таблиц симуляций.
+
+    У блюда без цены меню маржи не существует — отдаём None по всем трём полям,
+    дельта UC при этом остаётся осмысленной и считается как обычно.
+    """
+    if old.margin_percent is None or new.margin_percent is None:
+        return {
+            "old_margin_percent": None,
+            "new_margin_percent": None,
+            "delta_margin_percent": None,
+        }
+    return {
+        "old_margin_percent": float(old.margin_percent),
+        "new_margin_percent": float(new.margin_percent),
+        "delta_margin_percent": round(
+            float(new.margin_percent - old.margin_percent), 1
+        ),
+    }
+
+
 def kbju_coverage_status(coverage: Decimal) -> str:
     """Насколько КБЖУ блюда заполнено по весу состава: complete / partial / poor.
 
@@ -108,7 +134,7 @@ def _compute_uc(
     data: KitchenData,
     dish_id: str,
     dish_name: str,
-    price_menu: Decimal,
+    price_menu: Decimal | None,
     ttk_rows: list[TTKRow],
     substitutions: dict[int, int] | None = None,
 ) -> DishUCResult:
@@ -121,15 +147,17 @@ def _compute_uc(
     ТТК с этим ингредиентом используется новый ингредиент при ТОМ ЖЕ нетто-весе —
     нужно для симуляции замены (пересчёт цены и КБЖУ). По умолчанию None — обычный расчёт.
     """
+    has_price = price_menu is not None and price_menu > 0
+
     if not ttk_rows:
         return DishUCResult(
             dish_id=dish_id,
             dish_name=dish_name,
             price_menu=price_menu,
             uc_rub=Decimal("0"),
-            uc_percent=Decimal("0"),
-            margin_rub=price_menu,
-            margin_percent=Decimal("100"),
+            uc_percent=Decimal("0") if has_price else None,
+            margin_rub=price_menu if has_price else None,
+            margin_percent=Decimal("100") if has_price else None,
             output_grams=Decimal("0"),
             ingredients=[],
             warnings=["В ТТК нет ни одной строки для этого блюда"],
@@ -164,9 +192,12 @@ def _compute_uc(
             # но ингредиент остаётся в составе с cost=0: его вес входит в выход
             # блюда, КБЖУ и рецептуру ТТК. Иначе официальная карта молча
             # получалась бы неполной, а выход — заниженным.
-            if ing.price_per_unit is None:
+            # Цена ровно 0 — это тоже «данных нет»: ингредиент молча выпадал бы
+            # из UC, а шеф видел бы заниженную себестоимость без единого замечания.
+            if ing.price_per_unit is None or ing.price_per_unit == 0:
                 warnings.append(
-                    f"У ингредиента «{ing.name}» нет цены — в UC не учтён (стоимость 0)"
+                    f"У ингредиента «{ing.name}» не заполнена цена (пусто или 0) — "
+                    f"в UC не учтён (стоимость 0)"
                 )
                 cost = Decimal("0")
             elif ing.unit == "шт" and (not ing.weight_per_unit_g or ing.weight_per_unit_g == 0):
@@ -180,6 +211,7 @@ def _compute_uc(
             items.append(
                 DishIngredientCost(
                     name=ing.name,
+                    pos_name=ing.pos_name,
                     weight_g=row.weight_neto_g,
                     weight_brutto_g=_round_money(calculate_brutto_g(ing, row.weight_neto_g)),
                     unit=ing.unit,
@@ -238,17 +270,27 @@ def _compute_uc(
             total_cost += cost
 
     uc = _round_money(total_cost)
-    uc_percent = (
-        _round_percent(uc / price_menu * Decimal("100"))
-        if price_menu > 0
-        else Decimal("0")
-    )
-    margin = _round_money(price_menu - uc)
-    margin_percent = (
-        _round_percent(margin / price_menu * Decimal("100"))
-        if price_menu > 0
-        else Decimal("0")
-    )
+    # Без цены меню маржи не существует — не подставляем ноль, отдаём None,
+    # чтобы вывод честно показал «цена не заполнена», а не «маржа 0%».
+    if has_price:
+        uc_percent = _round_percent(uc / price_menu * Decimal("100"))
+        margin = _round_money(price_menu - uc)
+        margin_percent = _round_percent(margin / price_menu * Decimal("100"))
+        # Себестоимость выше цены продажи почти всегда означает кривые данные
+        # (единица «шт» вместо «кг», цена за упаковку вместо цены за кг), а не
+        # реальный убыток. Молчать об этом нельзя: 04.08.2026 так создалось
+        # блюдо с UC 1398 ₽ при цене 280 ₽, и бот не сказал ни слова.
+        if uc > price_menu:
+            warnings.append(
+                f"Себестоимость ({uc} ₽) выше цены меню ({price_menu} ₽) — "
+                f"маржа отрицательная. Проверь единицы измерения и цены "
+                f"ингредиентов, обычно это ошибка в данных"
+            )
+    else:
+        uc_percent = margin = margin_percent = None
+        warnings.append(
+            "Цена меню не заполнена — считаю только себестоимость, маржу не могу"
+        )
 
     if uc > 0:
         for item in items:
@@ -310,13 +352,16 @@ def calculate_uc_for_composition(
     data: KitchenData,
     dish_id: str,
     dish_name: str,
-    price_menu: Decimal,
+    price_menu: Decimal | None,
     rows: list[TTKRow],
 ) -> DishUCResult:
     """UC и КБЖУ для ещё НЕ сохранённого блюда (превью создания через create_dish).
 
     rows — список TTKRow в памяти (с временным dish_id). Калькулятор не пишет
     в кеш и не ищет блюдо — считает ровно по переданной рецептуре.
+
+    price_menu может быть None: шеф часто хочет узнать себестоимость ДО того,
+    как назначит цену. Тогда считаем UC, а маржу не считаем.
     """
     return _compute_uc(data, dish_id, dish_name, price_menu, rows)
 
@@ -425,15 +470,11 @@ def simulate_price_change(
         results.append({
             "dish_id": dish.id,
             "dish_name": dish.name,
-            "price_menu": float(dish.price_menu),
+            "price_menu": opt_float(dish.price_menu),
             "old_uc": float(old_uc.uc_rub),
             "new_uc": float(new_uc.uc_rub),
             "delta_uc": round(delta_uc, 2),
-            "old_margin_percent": float(old_uc.margin_percent),
-            "new_margin_percent": float(new_uc.margin_percent),
-            "delta_margin_percent": round(
-                float(new_uc.margin_percent - old_uc.margin_percent), 1
-            ),
+            **_margin_delta_fields(old_uc, new_uc),
         })
 
     return {
@@ -496,15 +537,11 @@ def simulate_replacement(
         results.append({
             "dish_id": dish.id,
             "dish_name": dish.name,
-            "price_menu": float(dish.price_menu),
+            "price_menu": opt_float(dish.price_menu),
             "old_uc": float(old_uc.uc_rub),
             "new_uc": float(new_uc.uc_rub),
             "delta_uc": round(float(new_uc.uc_rub - old_uc.uc_rub), 2),
-            "old_margin_percent": float(old_uc.margin_percent),
-            "new_margin_percent": float(new_uc.margin_percent),
-            "delta_margin_percent": round(
-                float(new_uc.margin_percent - old_uc.margin_percent), 1
-            ),
+            **_margin_delta_fields(old_uc, new_uc),
             "old_kcal": float(old_uc.kcal),
             "new_kcal": float(new_uc.kcal),
         })

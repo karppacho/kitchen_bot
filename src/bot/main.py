@@ -9,14 +9,34 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.filters import Command
 from aiogram.types import FSInputFile, Message
 from loguru import logger
+from openai import APIConnectionError, APITimeoutError
 
 from src.config import settings
 from src.llm.client import chat
 from src.llm.history import clear as clear_history
+from src.bot import competitors as competitors_cmds
 from src.bot.competitors import register as register_competitors
+from src.bot.keyboards import (
+    BOT_COMMANDS,
+    BTN_BACK,
+    BTN_PRICING,
+    BTN_COMP_ADD,
+    BTN_COMP_CHECK,
+    BTN_COMP_LIST,
+    BTN_COMP_REMOVE,
+    BTN_COMP_REPORT,
+    BTN_COMPETITORS,
+    BTN_HELP,
+    BTN_NEW,
+    BTN_REFRESH,
+    COMPETITORS_KB,
+    MAIN_KB,
+)
 from src.bot.telegram_text import split_for_telegram
 from src.competitors.service import run_check as run_competitors_check
 from src.data.sheets import get_data, reload_data
+from src.pricing import service as pricing_service
+from src.pricing.format import format_pricing_result
 
 # parse_mode=HTML: числовые ответы приходят с таблицей в <pre> (моноширинный шрифт,
 # колонки выравниваются). Текст ответов экранируется в src/llm/format.py.
@@ -51,29 +71,23 @@ async def cmd_start(message: Message):
     if not _is_authorized(message.from_user.id):
         await message.answer("Доступ закрыт.")
         return
+    # Список команд не дублируем: он в кнопке «Меню» и на клавиатуре ниже.
+    # Здесь — только то, что кнопкой не выразишь: как со мной разговаривать.
     await message.answer(
-        "Привет. Я ассистент R&D кухни.\n\n"
-        "Умею:\n"
-        "• Считать UC и маржу блюд («сколько стоит чизбургер»)\n"
-        "• Искать блюда с ингредиентом («где используется моцарелла»)\n"
-        "• Сравнивать маржу («у какого ролла лучшая маржа»)\n"
-        "• Показывать список блюд («какие у нас шаурмы»)\n"
-        "• Симулировать изменение цены и замену ингредиента\n"
-        "• Генерировать ТТК (.docx) — сначала покажу превью, по «да» пришлю файл\n"
-        "• Создавать новые блюда («новое блюдо: тортилья 60, курица 80, цена 220») — "
-        "покажу состав и UC, запишу в таблицу после твоего «да»\n\n"
-        "Команды:\n"
-        "/refresh — перечитать таблицу после изменений\n"
-        "/new — начать новый диалог (сбросить контекст)\n"
-        "/help — это сообщение\n\n"
-        "Мониторинг конкурентов (раз в неделю автоматически):\n"
-        "/list_competitors — кого отслеживаем\n"
-        "/add_competitor <url> [название] — добавить сайт\n"
-        "/remove_competitor <url> — убрать сайт\n"
-        "/check_competitors — проверить прямо сейчас\n"
-        "/competitors_report — отчёт в Google Sheets\n"
-        "Если сайт не пускает бота — сохрани страницу меню (Ctrl+S) "
-        "и пришли файл с подписью-названием конкурента."
+        "Привет. Я ассистент R&D кухни. Спрашивай обычными словами:\n\n"
+        "• «сколько стоит чизбургер» — UC, маржа, разбивка по составу\n"
+        "• «где используется моцарелла» — в каких блюдах ингредиент\n"
+        "• «у какого ролла лучшая маржа» — сравнение\n"
+        "• «какие у нас шаурмы» — список блюд\n"
+        "• «что если говядина подорожает на 15%» — пересчёт всех блюд\n"
+        "• «заменим айсберг на пекинскую капусту» — что будет с UC и КБЖУ\n"
+        "• «сделай ТТК на гриль ролл» — покажу превью, по «да» пришлю .docx\n"
+        "• «новое блюдо: тортилья 1шт, курица 80, цена 220» — посчитаю и, "
+        "после твоего «да», запишу в таблицу\n\n"
+        "Кнопки внизу — для команд. Все команды также в меню слева от поля ввода.\n\n"
+        "Если сайт конкурента не пускает бота — сохрани страницу меню (Ctrl+S) "
+        "и пришли файл с подписью-названием конкурента.",
+        reply_markup=MAIN_KB,
     )
 
 
@@ -112,9 +126,64 @@ async def cmd_refresh(message: Message):
         await message.answer(f"Ошибка при чтении таблицы: {e}")
 
 
+@dp.message(Command("pricing"))
+async def cmd_pricing(message: Message):
+    if not _is_authorized(message.from_user.id):
+        return
+    if pricing_service.is_running():
+        await message.answer(pricing_service.ALREADY_RUNNING_MSG)
+        return
+    await message.answer("Пересчитываю расчётку для коммерческого отдела...")
+    try:
+        results = await pricing_service.rebuild()
+    except Exception as e:
+        logger.exception("Пересчёт расчётки упал")
+        await message.answer(f"Не получилось пересчитать: {e}", parse_mode=None)
+        return
+    await _send_long(message, format_pricing_result(results))
+
+
 # Команды мониторинга конкурентов. СТРОГО до on_text: Dispatcher проверяет свои
 # хендлеры в порядке регистрации, catch-all F.text иначе перехватит команды.
 register_competitors(dp)
+
+
+# Подпись кнопки → тот же обработчик, что и у команды. Аргументов у кнопки нет,
+# и это ровно то, что нужно: cmd_add_competitor без URL сам ответит подсказкой
+# формата, то есть кнопка работает как приглашение прислать ссылку.
+BUTTON_ACTIONS = {
+    BTN_REFRESH: cmd_refresh,
+    BTN_NEW: cmd_new,
+    BTN_HELP: cmd_start,
+    BTN_PRICING: cmd_pricing,
+    BTN_COMP_LIST: competitors_cmds.cmd_list_competitors,
+    BTN_COMP_CHECK: competitors_cmds.cmd_check_competitors,
+    BTN_COMP_REPORT: competitors_cmds.cmd_competitors_report,
+    BTN_COMP_ADD: competitors_cmds.cmd_add_competitor,
+    BTN_COMP_REMOVE: competitors_cmds.cmd_remove_competitor,
+}
+
+# Ловим ТОЧНОЕ совпадение с подписью — обычные вопросы шефа сюда не попадут
+# и уйдут дальше, в on_text → LLM. Регистрация до @dp.message(F.text) обязательна.
+_MENU_TEXTS = set(BUTTON_ACTIONS) | {BTN_COMPETITORS, BTN_BACK}
+
+
+@dp.message(F.text.in_(_MENU_TEXTS))
+async def on_menu_button(message: Message):
+    if not _is_authorized(message.from_user.id):
+        return
+    text = message.text
+    if text == BTN_COMPETITORS:
+        await message.answer(
+            "Мониторинг конкурентов. Раз в неделю проверяю сам, "
+            "сводку пришлю при заметных изменениях цен.",
+            reply_markup=COMPETITORS_KB,
+        )
+        return
+    if text == BTN_BACK:
+        await message.answer("Главное меню.", reply_markup=MAIN_KB)
+        return
+    await BUTTON_ACTIONS[text](message)
 
 
 @dp.message(F.text)
@@ -137,6 +206,14 @@ async def on_text(message: Message):
         result = await loop.run_in_executor(None, chat, text, user_id)
         reply = result.text
         files = result.files
+    except (APITimeoutError, APIConnectionError):
+        # Сеть, а не логика. «Request timed out» шефу ничего не говорит —
+        # он должен понимать, что это не его вопрос сломал бота.
+        logger.exception("Не достучался до polza.ai")
+        reply = (
+            "Не смог связаться с polza.ai — похоже, проблема со связью, "
+            "а не с твоим вопросом. Повтори через минуту, всё остальное работает."
+        )
     except Exception as e:
         logger.exception("Ошибка обработки сообщения")
         reply = f"Что-то пошло не так: {e}"
@@ -184,6 +261,23 @@ async def main():
         except Exception:
             logger.exception("Еженедельная проверка конкурентов упала")
 
+    async def _weekly_pricing_rebuild():
+        """Пересчёт расчётки. Сводка — всем разрешённым: это рассылка, как у
+        конкурентов. Смысл в том, чтобы не проглядеть подорожание сырья."""
+        try:
+            results = await pricing_service.rebuild()
+        except Exception:
+            logger.exception("Еженедельный пересчёт расчётки упал")
+            return
+        text = format_pricing_result(results)
+        for user_id in settings.telegram_allowed_user_ids:
+            for chunk in split_for_telegram(text):
+                try:
+                    await bot.send_message(user_id, chunk)
+                except Exception as e:
+                    logger.warning(f"[расчётка] сводка не ушла {user_id}: {e}")
+                    break
+
     scheduler = AsyncIOScheduler(timezone="Europe/Moscow")
     scheduler.add_job(
         _weekly_competitors_check,
@@ -193,11 +287,28 @@ async def main():
             minute=settings.competitors_check_minute,
         ),
     )
+    scheduler.add_job(
+        _weekly_pricing_rebuild,
+        CronTrigger(
+            day_of_week=settings.pricing_check_day,
+            hour=settings.pricing_check_hour,
+            minute=settings.pricing_check_minute,
+        ),
+    )
     scheduler.start()
     logger.info(
         f"Мониторинг конкурентов: {settings.competitors_check_day} "
-        f"{settings.competitors_check_hour:02d}:{settings.competitors_check_minute:02d} МСК"
+        f"{settings.competitors_check_hour:02d}:{settings.competitors_check_minute:02d} МСК; "
+        f"расчётка: {settings.pricing_check_day} "
+        f"{settings.pricing_check_hour:02d}:{settings.pricing_check_minute:02d} МСК"
     )
+
+    # Нативное меню Telegram (кнопка «Меню» слева от поля ввода). Не критично
+    # для работы: если Bot API не ответил — стартуем без него, кнопки на месте.
+    try:
+        await bot.set_my_commands(BOT_COMMANDS)
+    except Exception as e:
+        logger.warning(f"Не смог зарегистрировать меню команд: {e}")
 
     logger.info(f"Бот стартует. Модель: {settings.llm_model}")
     await dp.start_polling(bot)

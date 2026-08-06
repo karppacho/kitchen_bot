@@ -157,8 +157,14 @@ async def run_check(
     only_url: str | None = None,
     notify: bool = True,
     export: bool = True,
+    notify_user_id: int | None = None,
 ) -> str:
-    """Полный прогон по активным конкурентам. Возвращает текст сводки."""
+    """Полный прогон по активным конкурентам. Возвращает текст сводки.
+
+    notify_user_id: кому слать сводку. Задан — только этому пользователю (ручной
+    запуск: результат нужен тому, кто попросил). None — всем разрешённым
+    (еженедельный крон: это рассылка, её ждут все).
+    """
     if _check_lock.locked():
         return ALREADY_RUNNING_MSG
 
@@ -196,16 +202,24 @@ async def run_check(
         )
 
         if notify and bot is not None:
-            await _send_summary(bot, summary)
+            await _send_summary(bot, summary, notify_user_id)
         return summary
 
 
-async def _send_summary(bot, summary: str) -> None:
-    """Сводка — всем разрешённым пользователям (в личке chat_id == user_id)."""
+async def _send_summary(bot, summary: str, only_user_id: int | None = None) -> None:
+    """Сводка в личку (chat_id == user_id).
+
+    only_user_id задан — шлём одному ему (ручной запуск). Иначе всем разрешённым
+    пользователям — это еженедельная рассылка.
+    """
     from aiogram.exceptions import TelegramBadRequest
     from src.bot.telegram_text import split_for_telegram
 
-    for user_id in settings.telegram_allowed_user_ids:
+    recipients = (
+        [only_user_id] if only_user_id is not None
+        else settings.telegram_allowed_user_ids
+    )
+    for user_id in recipients:
         for chunk in split_for_telegram(summary):
             try:
                 await bot.send_message(user_id, chunk)

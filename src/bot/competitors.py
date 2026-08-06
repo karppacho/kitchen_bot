@@ -126,7 +126,11 @@ async def cmd_check_competitors(message: Message):
 
 async def _run_check_safe(message: Message):
     try:
-        await service.run_check(message.bot, trigger="manual")
+        # Сводка — только тому, кто нажал: ручной прогон чаще всего отладочный,
+        # рассылать его второму пользователю незачем. Всем шлёт только крон.
+        await service.run_check(
+            message.bot, trigger="manual", notify_user_id=message.from_user.id,
+        )
     except Exception as e:
         logger.exception("Ручная проверка конкурентов упала")
         await message.answer(f"Проверка конкурентов упала: {e}", parse_mode=None)

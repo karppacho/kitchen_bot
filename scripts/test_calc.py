@@ -21,12 +21,20 @@ def print_dish_full(data, dish_id):
     print()
     print("=" * 95)
     print(f"{result.dish_id} — {result.dish_name}")
-    print(
-        f"Цена меню: {result.price_menu} ₽ | "
-        f"UC: {result.uc_rub} ₽ ({result.uc_percent}%) | "
-        f"Маржа: {result.margin_rub} ₽ ({result.margin_percent}%) | "
-        f"Выход: {result.output_grams} г"
-    )
+    if result.price_menu is None:
+        # Цены меню нет — маржи не существует. Не печатаем «None%».
+        print(
+            f"Цена меню: не заполнена | "
+            f"Себестоимость: {result.uc_rub} ₽ | "
+            f"Выход: {result.output_grams} г"
+        )
+    else:
+        print(
+            f"Цена меню: {result.price_menu} ₽ | "
+            f"UC: {result.uc_rub} ₽ ({result.uc_percent}%) | "
+            f"Маржа: {result.margin_rub} ₽ ({result.margin_percent}%) | "
+            f"Выход: {result.output_grams} г"
+        )
     print("=" * 95)
 
     main_items = [i for i in result.ingredients if i.row_type == "Основной"]
@@ -79,11 +87,15 @@ def print_summary(data):
             continue
         n_warn = len(result.warnings)
         warn_mark = f"{n_warn}" if n_warn else "-"
+        uc_pct = f"{float(result.uc_percent):>5.1f}%" if result.uc_percent is not None else "    — "
+        marg = (
+            f"{float(result.margin_percent):>7.1f}%"
+            if result.margin_percent is not None else "      — "
+        )
         print(
             f"{dish.id:<6} {dish.name[:48]:<50} "
             f"{float(result.uc_rub):>9.2f} "
-            f"{float(result.uc_percent):>5.1f}% "
-            f"{float(result.margin_percent):>7.1f}% "
+            f"{uc_pct} {marg} "
             f"{warn_mark:>5}"
         )
     print("=" * 95)

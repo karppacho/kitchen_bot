@@ -5,25 +5,17 @@
 органолептика) генерирует LLM-слой и передаёт сюда готовыми — тут их не сочиняем.
 """
 import re
-from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
 
 from docxtpl import DocxTemplate
 
 from src.calc.costs import calculate_dish_uc
-from src.config import settings
 from src.data.sheets import KitchenData
 
-# Шаблон лежит в корне проекта (src/ttk/builder.py → ../../)
+# Шаблон лежит в корне проекта (src/ttk/builder.py → ../../).
+# Генерируется скриптом build_ttk_template.py по образцу TTK_template.pdf.
 TEMPLATE_PATH = Path(__file__).resolve().parents[2] / "TTK_template.docx"
-
-# Реквизиты сети берём из конфига (.env), дефолты — в src/config.py.
-
-_MONTHS = [
-    "января", "февраля", "марта", "апреля", "мая", "июня",
-    "июля", "августа", "сентября", "октября", "ноября", "декабря",
-]
 
 
 def _g(x: Decimal | float | None) -> str:
@@ -40,11 +32,6 @@ def _ttk_number_from_dish(dish_id: str) -> str:
     """
     m = re.search(r"\d+", dish_id or "")
     return str(int(m.group())) if m else (dish_id or "")
-
-
-def _today_ru() -> str:
-    now = datetime.now()
-    return f"{now.day:02d} {_MONTHS[now.month - 1]} {now.year} г."
 
 
 def build_ttk_context(data: KitchenData, dish_id: str) -> tuple[dict, dict] | None:
@@ -66,14 +53,22 @@ def build_ttk_context(data: KitchenData, dish_id: str) -> tuple[dict, dict] | No
     main_items = [i for i in result.ingredients if i.row_type == "Основной"]
     has_composition = len(main_items) > 0
 
+    # В документ идёт «Короткое для айки» (колонка E в ING): по карте работают
+    # технологи, а они видят в iiko именно эти названия — по «Салат айсберг»
+    # вместо «Салат айсберг пф» непонятно, брать сырьё или полуфабрикат.
+    # Колонка заполнена не у всех, поэтому фолбэк на обычное имя + замечание.
+    def _doc_name(item) -> str:
+        return item.pos_name.strip() or item.name
+
     ingredients = [
         {
-            "name": i.name,
+            "name": _doc_name(i),
             "brutto": _g(i.weight_brutto_g if i.weight_brutto_g is not None else i.weight_g),
             "netto": _g(i.weight_g),
         }
         for i in main_items
     ]
+    no_pos_name = [i.name for i in main_items if not i.pos_name.strip()]
 
     output = result.output_grams
     if output and output > 0:
@@ -94,12 +89,10 @@ def build_ttk_context(data: KitchenData, dish_id: str) -> tuple[dict, dict] | No
         "ккал": _g(result.kcal),
     }
 
+    # Реквизитов сети, даты утверждения и ссылок на ТР ТС в контексте нет:
+    # в форме шефа (TTK_template.pdf, август 2026) этих блоков не осталось.
     context = {
-        "org_name": settings.ttk_org_name,
-        "director_position": settings.ttk_director_position,
-        "approval_date": _today_ru(),
         "ttk_number": _ttk_number_from_dish(dish.id),
-        "tr_ts_number": settings.ttk_tr_ts_number,
         "dish_name": dish.name,
         "ingredients": ingredients,
         "dish_output_g": _g(output),
@@ -113,6 +106,14 @@ def build_ttk_context(data: KitchenData, dish_id: str) -> tuple[dict, dict] | No
         "organoleptic_consistency": "",
     }
 
+    warnings = list(result.warnings)
+    if no_pos_name:
+        warnings.append(
+            f"Не заполнено «Короткое для айки» у {len(no_pos_name)} ингр. "
+            f"({', '.join(no_pos_name)}) — в карту попало обычное название, "
+            f"технолог может не понять, какой ПФ брать"
+        )
+
     kbju_complete = not any("КБЖУ нет" in w for w in result.warnings)
     meta = {
         "dish_id": dish.id,
@@ -120,8 +121,13 @@ def build_ttk_context(data: KitchenData, dish_id: str) -> tuple[dict, dict] | No
         "has_composition": has_composition,
         "kbju_complete": kbju_complete,
         "kbju_coverage": float(result.kbju_coverage),
-        "warnings": result.warnings,
-        "ingredients": ingredients,  # для подсказки LLM в техпроцессе/органолептике
+        "warnings": warnings,
+        # Для подсказки LLM в техпроцессе/органолептике — ОБЫЧНЫЕ имена: модели
+        # проще писать про «салат айсберг», чем про «Салат айсберг пф».
+        "ingredients": [
+            {"name": i.name, "brutto": ing["brutto"], "netto": ing["netto"]}
+            for i, ing in zip(main_items, ingredients)
+        ],
         "output_g": _g(output),
     }
     return context, meta

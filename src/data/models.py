@@ -58,7 +58,10 @@ class Dish(BaseModel):
     id: str  # "B001"
     name: str
     category: str
-    price_menu: Decimal
+    # None — цена меню не заполнена. Это штатная ситуация: у соусов-топпингов
+    # (B003-B010) цены меню нет по смыслу, у новых блюд она появляется позже.
+    # Себестоимость считаем всё равно, маржу — нет.
+    price_menu: Decimal | None = None
     uc_actual_pos: Decimal | None = None  # из айки
     status: Literal["активное", "разработка", "архив"] = "активное"
 
@@ -93,6 +96,10 @@ class DishIngredientCost(BaseModel):
     """Стоимость одного ингредиента в составе блюда."""
 
     name: str
+    # «Короткое для айки» (колонка E в ING). Технологи работают в iiko и по
+    # обычному имени не всегда понимают, какой ПФ брать, — в ТТК идёт это имя.
+    # Пусто у части позиций, поэтому потребитель делает фолбэк на name.
+    pos_name: str = ""
     weight_g: Decimal  # нетто
     weight_brutto_g: Decimal | None = None  # брутto (с учётом потерь), для рецептуры ТТК
     unit: str = "кг"
@@ -108,11 +115,13 @@ class DishUCResult(BaseModel):
 
     dish_id: str
     dish_name: str
-    price_menu: Decimal
+    # Всё, что зависит от цены меню, — None, если цены нет. UC и выход считаются
+    # всегда: себестоимость от цены продажи не зависит.
+    price_menu: Decimal | None = None
     uc_rub: Decimal
-    uc_percent: Decimal
-    margin_rub: Decimal
-    margin_percent: Decimal
+    uc_percent: Decimal | None = None
+    margin_rub: Decimal | None = None
+    margin_percent: Decimal | None = None
     output_grams: Decimal  # выход съедобной части
     # КБЖУ на всё блюдо (по нетто-весу основных ингредиентов)
     proteins_g: Decimal = Decimal("0")

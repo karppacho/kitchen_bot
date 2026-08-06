@@ -218,3 +218,40 @@ def test_format_summary_escapes_and_reports_failures():
     assert "Не смог проверить:" in text
     assert "ручной режим" in text
     assert "первый срез" in text
+
+
+# ---------- кому уходит сводка ----------
+
+class _FakeBot:
+    """Ловит вызовы send_message, чтобы проверить список получателей."""
+
+    def __init__(self):
+        self.sent: list[tuple[int, str]] = []
+
+    async def send_message(self, chat_id, text, **kwargs):
+        self.sent.append((chat_id, text))
+
+
+def _run_send(only_user_id):
+    import asyncio
+    from src.competitors.service import _send_summary
+    bot = _FakeBot()
+    asyncio.run(_send_summary(bot, "Сводка по конкурентам", only_user_id))
+    return [uid for uid, _ in bot.sent]
+
+
+def test_manual_check_notifies_only_requester():
+    """Ручной прогон — ответ только тому, кто попросил.
+
+    Раньше сводка уходила всем разрешённым: разработчик проверял бота, а сообщение
+    прилетало и шефу.
+    """
+    allowed = settings.telegram_allowed_user_ids
+    assert len(allowed) >= 2, "тест имеет смысл только при нескольких пользователях"
+    me = allowed[0]
+    assert _run_send(me) == [me]
+
+
+def test_cron_check_notifies_everyone():
+    """Еженедельный прогон — это рассылка, её ждут все."""
+    assert _run_send(None) == list(settings.telegram_allowed_user_ids)

@@ -59,11 +59,15 @@ def make_data() -> KitchenData:
 
 
 def make_b001_data() -> KitchenData:
-    """Замороженный слепок B001 (Гриль ролл с говядиной) на июнь 2026.
+    """Замороженный слепок «Гриль ролла с говядиной» — каким он был в июне 2026.
 
-    Точные входные данные из живой таблицы — чтобы детерминированно, без сети,
-    воспроизводить эталон: UC 149.08 ₽, маржа 109.92 ₽ (42.4%), выход 190.5 г.
-    Защищает ЛОГИКУ калькулятора (потери, штучные/весовые, упаковка, доли).
+    ВАЖНО: это синтетическая фикстура, а не текущий B001 из таблицы. В июле 2026
+    шеф перестроил таблицу и id B001 достался другому блюду; слепок оставлен как
+    есть намеренно — он проверяет ЛОГИКУ калькулятора (потери, штучные/весовые,
+    упаковка, доли) и не должен зависеть от того, что сейчас в Google Sheets.
+    Эталон живой таблицы — отдельно, в test_live_benchmark.
+
+    Эталонные числа: UC 149.08 ₽, маржа 109.92 ₽ (42.4%), выход 190.5 г.
     """
     d = KitchenData()
     d.ingredients = {
@@ -213,24 +217,110 @@ def test_b001_benchmark_components():
     assert costs["Упаковка/коробка бумажная"] == Decimal("12.20")  # упаковка, без потерь
 
 
-def test_b001_live_benchmark():
-    """Живой регресс на реальной таблице — защищает ДАННЫЕ от дрейфа.
+# ---------- Живая таблица ----------
+# Шеф правит таблицу постоянно, поэтому «заморозить одно блюдо» — недостаточная
+# защита: в июле 2026 таблицу перестроили целиком, эталонный B001 стал другим
+# блюдом, и тест месяц падал вхолостую. Поэтому здесь два уровня:
+# структурная целостность (переживает любые правки) + один эталон (перепривязывается).
 
-    Без доступа к Sheets (нет creds/сети) — тихо пропускаем, чтобы тест-набор
-    оставался офлайн-дружелюбным. Падение здесь при наличии доступа = данные B001
-    в таблице изменились, нужно разобраться.
-    """
+def _live_data():
+    """Живая база или None, если доступа к Sheets нет (офлайн-прогон)."""
     try:
         from src.data.sheets import get_data
-        data = get_data()
+        return get_data()
     except Exception:
-        return  # нет доступа — пропускаем
-    r = calculate_dish_uc(data, "B001")
+        return None
+
+
+def test_live_referential_integrity():
+    """Каждая ссылка из ТТК разрешается в ING/Упаковку.
+
+    Это и ловит настоящий дрейф id: если ссылки побились, бот считает
+    себестоимость по чужим продуктам и молчит об этом.
+    """
+    data = _live_data()
+    if data is None:
+        return
+    broken_ing, broken_pack = [], []
+    for dish_id, rows in data.ttk_by_dish.items():
+        for row in rows:
+            if row.row_type == "Упаковка":
+                if row.packaging_id is not None and row.packaging_id not in data.packagings:
+                    broken_pack.append((dish_id, row.packaging_id))
+            elif row.ingredient_id is not None and row.ingredient_id not in data.ingredients:
+                broken_ing.append((dish_id, row.ingredient_id))
+    assert not broken_ing, f"ТТК ссылается на несуществующие ингредиенты: {broken_ing[:10]}"
+    assert not broken_pack, f"ТТК ссылается на несуществующую упаковку: {broken_pack[:10]}"
+
+
+# Дубли среди АКТИВНЫХ имён, известные на 04.08.2026. Чинятся на стороне шефа
+# (переименовать или заархивировать лишнюю позицию). Тест-храповик: список не
+# должен РАСТИ. Когда шеф разведёт пару — просто убери имя отсюда.
+# Пары «архив + активная» сюда не входят: бот их больше не путает.
+KNOWN_DUPLICATE_ING_NAMES = {
+    "рыбные палочки",       # id 38 и 110, обе активные
+}
+
+
+def test_live_no_new_duplicate_ingredient_names():
+    """Имя ингредиента — ключ для человека, по нему бот ищет (правило №4).
+
+    Считаем только активные: пара «архивная + активная» неоднозначности не даёт,
+    в новое блюдо архив не предлагается. Тест следит, чтобы не появлялись НОВЫЕ
+    дубли (вечно красный тест перестают читать, а этот должен что-то значить).
+    """
+    data = _live_data()
+    if data is None:
+        return
+    dupes = data.duplicate_ingredient_names()
+    new = {n: ids for n, ids in dupes.items() if n not in KNOWN_DUPLICATE_ING_NAMES}
+    assert not new, f"новые дубли имён среди активных ингредиентов ING: {new}"
+
+
+def test_duplicate_names_ignore_archived():
+    """Архивная позиция не должна считаться дублем активной (офлайн)."""
+    d = make_data()
+    d.ingredients[9] = Ingredient(
+        id=9, category="Овощи", name="Салат", unit="кг",
+        price_per_unit=Decimal("400"), status="архив",
+    )
+    assert d.duplicate_ingredient_names() == {}
+    # А две активные с одним именем — настоящий дубль
+    d.ingredients[9].status = "активный"
+    assert d.duplicate_ingredient_names() == {"салат": [3, 9]}
+
+
+def test_live_sanity():
+    """Таблица не должна внезапно «похудеть» — ловит сломанный парсинг и обрезку."""
+    data = _live_data()
+    if data is None:
+        return
+    assert len(data.ingredients) >= 100, f"ингредиентов всего {len(data.ingredients)}"
+    assert len(data.dishes) >= 100, f"блюд всего {len(data.dishes)}"
+    assert len(data.ttk_by_dish) >= 100, f"блюд с составом всего {len(data.ttk_by_dish)}"
+    assert data.cooking_methods, "лист способов приготовления не загрузился"
+
+
+def test_live_benchmark():
+    """Эталон на живой таблице: B119 «Английский завтрак с драником» (июль 2026).
+
+    Выбран потому, что UC определён полностью — 6 позиций + упаковка, у всех
+    заполнены цены (единственное замечание блюда — про КБЖУ, на UC не влияет).
+
+    Падение здесь = либо регрессия в расчёте, либо шеф поменял состав/цены B119.
+    Во втором случае эталон надо ПЕРЕПРИВЯЗАТЬ, а не подгонять код: сверься с
+    `python -m scripts.test_calc B119` и обнови числа тут и в CLAUDE.md.
+    """
+    data = _live_data()
+    if data is None:
+        return
+    r = calculate_dish_uc(data, "B119")
     if r is None:
-        return  # блюда нет в текущей таблице
-    assert r.uc_rub == Decimal("149.08"), f"B001 UC поплыл: {r.uc_rub}"
-    assert r.margin_rub == Decimal("109.92"), f"B001 маржа поплыла: {r.margin_rub}"
-    assert r.output_grams == Decimal("190.5"), f"B001 выход поплыл: {r.output_grams}"
+        return  # блюда нет в текущей таблице — разберётся test_live_sanity
+    assert r.uc_rub == Decimal("151.84"), f"B119 UC поплыл: {r.uc_rub}"
+    assert r.uc_percent == Decimal("31.7"), f"B119 UC% поплыл: {r.uc_percent}"
+    assert r.margin_rub == Decimal("327.16"), f"B119 маржа поплыла: {r.margin_rub}"
+    assert r.output_grams == Decimal("281"), f"B119 выход поплыл: {r.output_grams}"
 
 
 def test_kbju_coverage_poor():
@@ -280,7 +370,87 @@ def test_replacement_real():
     assert dish["new_uc"] == 25.57                # 8.57 + 5.00 + 12.00
 
 
+# ---------- Блюдо без цены меню ----------
+
+def test_dish_without_price_counts_uc_but_not_margin():
+    """Цены меню нет (соус-топпинг) → себестоимость считаем, маржу нет.
+
+    Ноль вместо None был бы враньём: шеф прочитал бы «маржа 0%» как настоящий ноль.
+    """
+    d = make_data()
+    d.dishes["T001"].price_menu = None
+    r = calculate_dish_uc(d, "T001")
+    assert r.uc_rub == Decimal("70.57")           # себестоимость от цены не зависит
+    assert r.output_grams == Decimal("160")
+    assert r.price_menu is None
+    assert r.uc_percent is None
+    assert r.margin_rub is None
+    assert r.margin_percent is None
+    assert any("Цена меню не заполнена" in w for w in r.warnings)
+    # Доли ингредиентов в UC считаются как обычно — они от цены меню не зависят
+    assert sum(i.share_percent for i in r.ingredients) == Decimal("100.0")
+
+
+def test_dish_without_price_and_without_composition():
+    """Ни цены, ни состава — не должно падать на вычитании из None."""
+    d = make_data()
+    d.dishes["T001"].price_menu = None
+    d.ttk_by_dish = {}
+    r = calculate_dish_uc(d, "T001")
+    assert r.uc_rub == Decimal("0")
+    assert r.margin_rub is None
+    assert r.margin_percent is None
+
+
+def test_simulate_includes_dish_without_price():
+    """В симуляции блюдо без цены остаётся: дельта UC осмысленна, маржа — None."""
+    d = make_data()
+    d.dishes["T001"].price_menu = None
+    r = simulate_price_change(d, 3, new_price=Decimal("1000"))
+    assert r["affected_count"] == 1
+    row = r["dishes"][0]
+    assert row["price_menu"] is None
+    assert row["delta_uc"] > 0                    # подорожание видно
+    assert row["old_margin_percent"] is None
+    assert row["delta_margin_percent"] is None
+
+
 # ---------- Неполные данные: ингредиент остаётся в составе с cost=0 ----------
+
+def test_uc_above_price_warns():
+    """UC выше цены меню — почти всегда кривые данные, а не реальный убыток.
+
+    04.08.2026 так создалось блюдо с UC 1398 ₽ при цене 280 ₽ («шт» вместо «кг»
+    у колбасок), и бот записал его без единого замечания.
+    """
+    d = make_data()
+    d.ingredients[3].price_per_unit = Decimal("100000")   # салат по 100 000 ₽/кг
+    r = calculate_dish_uc(d, "T001")
+    assert r.uc_rub > r.price_menu
+    assert r.margin_rub < 0
+    assert any("выше цены меню" in w for w in r.warnings)
+
+
+def test_normal_dish_has_no_price_warning():
+    """Обычное блюдо — никаких лишних замечаний про маржу."""
+    r = calculate_dish_uc(make_data(), "T001")
+    assert not any("выше цены меню" in w for w in r.warnings)
+
+
+def test_zero_price_ingredient_warns():
+    """Цена ровно 0 — тоже «данных нет», обязано быть предупреждение.
+
+    Раньше проверка `is None` её не ловила: ингредиент молча давал 0 ₽,
+    и шеф видел заниженный UC без единого замечания.
+    """
+    d = make_data()
+    d.ingredients[3].price_per_unit = Decimal("0")
+    r = calculate_dish_uc(d, "T001")
+    salad = next(i for i in r.ingredients if i.name == "Салат")
+    assert salad.cost_rub == Decimal("0")
+    assert any("Салат" in w and "не заполнена цена" in w for w in r.warnings)
+
+
 
 def test_ingredient_without_price_stays_in_output():
     """Нет цены → стоимость 0, но вес входит в выход, КБЖУ и рецептуру ТТК."""
@@ -292,7 +462,7 @@ def test_ingredient_without_price_stays_in_output():
     assert salad.cost_rub == Decimal("0")
     assert r.uc_rub == Decimal("20.57")           # 8.57 + 0 + 12.00
     assert r.kcal == Decimal("200")               # КБЖУ салата всё ещё учтено
-    assert any("нет цены" in w for w in r.warnings)
+    assert any("не заполнена цена" in w for w in r.warnings)
 
 
 def test_piece_without_weight_stays_in_output():

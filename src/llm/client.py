@@ -8,6 +8,8 @@ import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from decimal import Decimal
+
+import httpx
 from loguru import logger
 from openai import OpenAI
 
@@ -22,10 +24,14 @@ from src.llm.format import (
     format_replacement,
     format_replacement_theoretical,
     format_ttk_preview,
+    format_ttk_batch_preview,
+    format_ttk_batch_result,
+    format_category_prompt,
     format_dish_preview,
     format_dish_created,
 )
 from src.calc.costs import (
+    opt_float,
     calculate_dish_uc,
     calculate_uc_for_composition,
     find_dishes_with_ingredient,
@@ -36,12 +42,19 @@ from src.calc.costs import (
 from src.ttk.builder import build_ttk_context, render_ttk
 from src.llm.history import get_history, append_turn
 
-# Один клиент на весь процесс. timeout: иначе зависший запрос к polza.ai
-# держит поток (и «печатает…» у шефа) до 10 минут — дефолта SDK.
+# Один клиент на весь процесс.
+#
+# Таймауты раздельные. Плоский timeout=60 означал 60 секунд на КАЖДУЮ фазу, и
+# при недоступной сети SDK успевал сделать три попытки по 60 с: 04.08.2026 шеф
+# ждал ответа 3 минуты 1 секунду, всё это время не видя ничего (индикатор
+# «печатает…» в Telegram живёт ~5 секунд). TLS-рукопожатие, не сложившееся за
+# 10 секунд, не сложится и за 60 — поэтому connect отделён от чтения. Долгий
+# read оставляем: LLM думает медленно, и это нормально.
 client = OpenAI(
     base_url=settings.polza_base_url,
     api_key=settings.polza_api_key,
-    timeout=60.0,
+    timeout=httpx.Timeout(60.0, connect=10.0),
+    max_retries=2,
 )
 
 # Промпты — читаем из файлов, не из кода
@@ -56,6 +69,10 @@ GENERATED_TTK_DIR = Path("generated_ttk")
 # Лимит шагов в цикле tool calling, чтобы избежать бесконечной петли
 MAX_TOOL_LOOPS = 8
 
+# Сколько ТТК готовы сделать за один раз. На каждую карту два запроса к LLM,
+# поэтому «все активные» (126 блюд) — это ~250 запросов и десятки минут.
+MAX_TTK_BATCH = 15
+
 
 @dataclass
 class ChatResult:
@@ -67,6 +84,25 @@ class ChatResult:
 # ================================================================
 # Реализация функций, которые LLM может вызывать
 # ================================================================
+
+
+def _not_found_error(data, query: str) -> dict:
+    """«Ингредиент не найден» — но сначала проверим строки ING без id.
+
+    Такие строки бот не загружает (id — ключ, на него ссылается ТТК), и шефу
+    важно понимать разницу между «нет в базе» и «есть, но не подхватилось».
+    """
+    q = query.lower().strip()
+    for line_no, name in getattr(data, "ingredients_without_id", []):
+        if q in name.lower() or name.lower() in q:
+            return {
+                "error": (
+                    f"«{name}» есть в ING (строка {line_no}), но у неё не проставлен "
+                    f"id в колонке A — поэтому бот её не видит. Проставь id и вызови "
+                    f"/refresh, тогда смогу с ней работать."
+                )
+            }
+    return {"error": f"Ингредиент '{query}' не найден"}
 
 
 def _resolve_ingredient(data, query: str):
@@ -85,14 +121,18 @@ def _resolve_ingredient(data, query: str):
     """
     matches = data.search_ingredients(query)
     if not matches:
-        return None, {"error": f"Ингредиент '{query}' не найден"}
+        return None, _not_found_error(data, query)
     if len(matches) == 1:
         return matches[0], None
-    # Точное совпадение по имени делает выбор однозначным
+    # Точное совпадение по имени делает выбор однозначным — но только если оно
+    # ОДНО. Двух активных тёзок (сахар id 12 и 123) точное имя не различает,
+    # и брать первого попавшегося нельзя: цены у них разные.
     q = query.lower().strip()
-    for ing in matches:
-        if ing.name.lower() == q:
-            return ing, None
+    exact = [i for i in matches if i.name.lower() == q]
+    if len(exact) == 1:
+        return exact[0], None
+    if len(exact) > 1:
+        matches = exact
 
     usage = {i.id: len(find_dishes_with_ingredient(data, i.id)) for i in matches}
     used = [i for i in matches if usage[i.id] > 0]
@@ -185,11 +225,11 @@ def _tool_calculate_dish_uc(args: dict) -> dict:
     out = {
         "dish_id": result.dish_id,
         "dish_name": result.dish_name,
-        "price_menu_rub": float(result.price_menu),
+        "price_menu_rub": opt_float(result.price_menu),
         "uc_rub": float(result.uc_rub),
-        "uc_percent": float(result.uc_percent),
-        "margin_rub": float(result.margin_rub),
-        "margin_percent": float(result.margin_percent),
+        "uc_percent": opt_float(result.uc_percent),
+        "margin_rub": opt_float(result.margin_rub),
+        "margin_percent": opt_float(result.margin_percent),
         "output_grams": float(result.output_grams),
         "proteins_g": float(result.proteins_g),
         "fats_g": float(result.fats_g),
@@ -246,7 +286,7 @@ def _tool_list_dishes(args: dict) -> dict:
                 "id": d.id,
                 "name": d.name,
                 "category": d.category,
-                "price_menu_rub": float(d.price_menu),
+                "price_menu_rub": opt_float(d.price_menu),
                 "status": d.status,
                 "has_composition": _has_comp(d.id),
             }
@@ -300,6 +340,14 @@ def _tool_compare_dishes_margin(args: dict) -> dict:
                 "id": d.id,
                 "name": d.name,
                 "reason": "состав не заполнен в ТТК",
+            })
+            continue
+        # Без цены меню маржи не существует — сравнивать нечего
+        if uc_result.margin_percent is None:
+            skipped.append({
+                "id": d.id,
+                "name": d.name,
+                "reason": "цена меню не заполнена",
             })
             continue
         rows.append({
@@ -523,6 +571,29 @@ def _generate_organoleptic(dish_name: str, ingredients_str: str, tech_hint: str)
     }
 
 
+def _fill_and_render_ttk(context: dict, meta: dict, tech_hint: str = "") -> Path:
+    """Догенерить тексты LLM и отрендерить .docx. Возвращает путь к файлу.
+
+    Общая часть одиночной и пакетной генерации. Бросает исключение при неудаче —
+    в пакете это ловится по каждому блюду отдельно, чтобы одна сбойная карта
+    не роняла всю пачку.
+    """
+    ingredients_str = ", ".join(f"{i['name']} {i['netto']} г" for i in meta["ingredients"])
+    context["tech_process"] = _generate_tech_process(
+        meta["dish_name"], ingredients_str, tech_hint
+    )
+    org = _generate_organoleptic(meta["dish_name"], ingredients_str, tech_hint)
+    context["organoleptic_appearance"] = org["appearance"]
+    context["organoleptic_color"] = org["color"]
+    context["organoleptic_taste_smell"] = org["taste_smell"]
+    context["organoleptic_consistency"] = org["consistency"]
+
+    safe = re.sub(r"[^\w\-]+", "_", meta["dish_name"]).strip("_")[:40]
+    out_path = GENERATED_TTK_DIR / f"TTK_{meta['dish_id']}_{safe}.docx"
+    render_ttk(context, out_path)
+    return out_path
+
+
 def _tool_generate_ttk_document(args: dict) -> dict:
     data = get_data()
     query = (args.get("dish_name_or_id") or "").strip()
@@ -561,28 +632,11 @@ def _tool_generate_ttk_document(args: dict) -> dict:
         return {"display": format_ttk_preview(context, meta)}
 
     tech_hint = (args.get("tech_process_hint") or "").strip()
-    ingredients_str = ", ".join(f"{i['name']} {i['netto']} г" for i in meta["ingredients"])
     try:
-        context["tech_process"] = _generate_tech_process(
-            meta["dish_name"], ingredients_str, tech_hint
-        )
-        org = _generate_organoleptic(meta["dish_name"], ingredients_str, tech_hint)
+        out_path = _fill_and_render_ttk(context, meta, tech_hint)
     except Exception as e:
-        logger.exception("Ошибка генерации текста ТТК")
-        return {"error": f"Не смог сгенерировать текст ТТК: {e}"}
-
-    context["organoleptic_appearance"] = org["appearance"]
-    context["organoleptic_color"] = org["color"]
-    context["organoleptic_taste_smell"] = org["taste_smell"]
-    context["organoleptic_consistency"] = org["consistency"]
-
-    safe = re.sub(r"[^\w\-]+", "_", meta["dish_name"]).strip("_")[:40]
-    out_path = GENERATED_TTK_DIR / f"TTK_{meta['dish_id']}_{safe}.docx"
-    try:
-        render_ttk(context, out_path)
-    except Exception as e:
-        logger.exception("Ошибка рендера ТТК")
-        return {"error": f"Не смог сформировать .docx: {e}"}
+        logger.exception("Ошибка формирования ТТК")
+        return {"error": f"Не смог сформировать ТТК: {e}"}
 
     display = (
         f"ТТК готова: {meta['dish_name']} (№ {context['ttk_number']}). Отправляю файлом.\n"
@@ -604,38 +658,170 @@ def _tool_generate_ttk_document(args: dict) -> dict:
     return {"display": display, "file_path": str(out_path)}
 
 
+def _tool_build_pricing_table(args: dict) -> dict:
+    """Пересборка расчётки для коммерческого отдела."""
+    from src.pricing.format import format_pricing_result
+    from src.pricing.service import rebuild_sync
+
+    raw = (args.get("status") or "").strip().lower()
+    if raw in ("разработка", "новинки", "новинка", "новые"):
+        statuses = ("разработка",)
+    elif raw in ("активное", "активные", "меню"):
+        statuses = ("активное",)
+    else:
+        statuses = ("разработка", "активное")
+
+    results = rebuild_sync(statuses)
+    return {
+        "sheets": [r.get("sheet") for r in results],
+        "display": format_pricing_result(results),
+    }
+
+
+def _tool_generate_ttk_batch(args: dict) -> dict:
+    """Пачка ТТК по статусу блюд: confirm=false → список, confirm=true → файлы."""
+    data = get_data()
+    status = (args.get("status") or "разработка").strip().lower()
+    if status in ("новинки", "новинка", "разработка"):
+        status = "разработка"
+    elif status in ("активное", "активные", "меню"):
+        status = "активное"
+    else:
+        return {"error": (
+            f"Не понял статус «{args.get('status')}». Бывает «разработка» (новинки) "
+            f"или «активное»."
+        )}
+
+    dishes = sorted(
+        (d for d in data.dishes.values() if d.status == status),
+        key=lambda d: (d.category or "", d.name),
+    )
+    if not dishes:
+        return {"error": f"Нет блюд со статусом «{status}»."}
+
+    ready = [d for d in dishes if data.ttk_by_dish.get(d.id)]
+    skipped = [d for d in dishes if not data.ttk_by_dish.get(d.id)]
+    if not ready:
+        return {"error": (
+            f"У всех блюд со статусом «{status}» ({len(dishes)}) не заполнен состав "
+            f"в ТТК — собирать карты не из чего."
+        )}
+
+    # На каждую карту два запроса к LLM. 126 активных блюд — это ~250 запросов,
+    # десятки минут и заметные деньги. Лучше отказать, чем спалить бюджет молча.
+    if len(ready) > MAX_TTK_BATCH:
+        return {"error": (
+            f"Блюд со статусом «{status}» слишком много: {len(ready)}. За раз делаю "
+            f"не больше {MAX_TTK_BATCH} — на каждую карту уходит два запроса к модели. "
+            f"Попроси по категории или по конкретным блюдам."
+        )}
+
+    if not bool(args.get("confirm")):
+        return {
+            "status_filter": status,
+            "count": len(ready),
+            "display": format_ttk_batch_preview(status, ready, skipped),
+        }
+
+    tech_hint = (args.get("tech_process_hint") or "").strip()
+    done: list[tuple[str, str]] = []      # (название, путь)
+    failed: list[tuple[str, str]] = []    # (название, причина)
+    poor_kbju: list[str] = []
+
+    for dish in ready:
+        try:
+            built = build_ttk_context(data, dish.id)
+            if built is None:
+                raise ValueError("не удалось собрать данные блюда")
+            context, meta = built
+            out_path = _fill_and_render_ttk(context, meta, tech_hint)
+            done.append((dish.name, str(out_path)))
+            if kbju_coverage_status(Decimal(str(meta["kbju_coverage"]))) == "poor":
+                poor_kbju.append(dish.name)
+        except Exception as e:
+            # Одна сбойная карта не должна ронять пачку
+            logger.exception(f"ТТК для {dish.id} не собралась")
+            failed.append((dish.name, str(e)))
+
+    return {
+        "status_filter": status,
+        "made": len(done),
+        "failed": len(failed),
+        "file_paths": [p for _, p in done],
+        "display": format_ttk_batch_result(done, failed, poor_kbju),
+    }
+
+
 def _resolve_ingredient_for_create(data, name: str):
     """Резолв ингредиента при создании блюда: (ingredient, error_dict).
 
     В отличие от _resolve_ingredient — БЕЗ авто-выбора по использованию в блюдах
     (для нового блюда это нерелевантно). Точное/единственное совпадение → берём;
     несколько → candidates; ноль → ошибка с просьбой завести ингредиент в ING.
+
+    Архивные позиции в НОВОЕ блюдо не предлагаем: шеф их вывел из оборота. Это
+    заодно снимает половину мнимых «дублей имён» — четыре из семи пар в ING это
+    архивная позиция против активной, и выбирать там на самом деле не из чего.
+    Из кеша архив при этом НЕ убираем: id 40 и 98 всё ещё стоят в составе
+    15 существующих блюд, их UC должен считаться по-прежнему.
     """
     matches = data.search_ingredients(name)
     if not matches:
+        err = _not_found_error(data, name)
+        # Строка в ING есть, просто без id — подсказка уже точная, не перетираем
+        if "не проставлен" not in err["error"]:
+            err = {
+                "error": (
+                    f"Ингредиент «{name}» не найден в ING. Сначала заведи его в "
+                    f"справочнике ING, потом создадим блюдо."
+                )
+            }
+        return None, err
+
+    active = [i for i in matches if i.status != "архив"]
+    if not active:
+        names = ", ".join(f"«{i.name}» (id {i.id})" for i in matches)
         return None, {
             "error": (
-                f"Ингредиент «{name}» не найден в ING. Сначала заведи его в "
-                f"справочнике ING, потом создадим блюдо."
+                f"Под «{name}» нашёлся только архив: {names}. В новое блюдо "
+                f"архивные позиции не ставлю — верни статус «активный» в ING "
+                f"или назови другой ингредиент."
             )
         }
+    matches = active
+
+    # Точное совпадение снимает неоднозначность, только если оно ОДНО. При двух
+    # активных строках с одинаковым именем (сахар: id 12 по 100 ₽/кг и id 123
+    # по 0 ₽/шт) взять первую попавшуюся значит молча посчитать не тот UC.
     q = name.lower().strip()
-    for ing in matches:
-        if ing.name.lower() == q:
-            return ing, None
-    if len(matches) == 1:
+    exact = [i for i in matches if i.name.lower() == q]
+    if len(exact) == 1:
+        return exact[0], None
+    if len(exact) > 1:
+        matches = exact
+    elif len(matches) == 1:
         return matches[0], None
     return None, {
         "error": f"Несколько ингредиентов под «{name}» — уточни, какой именно",
         "candidates": [
-            {"id": i.id, "name": i.name, "category": i.category, "unit": i.unit}
+            {
+                "id": i.id, "name": i.name, "category": i.category,
+                "unit": i.unit,
+                "price_per_unit_rub": (
+                    float(i.price_per_unit) if i.price_per_unit is not None else None
+                ),
+            }
             for i in matches
         ],
     }
 
 
 def _resolve_packaging_for_create(data, name: str):
-    """Резолв упаковки при создании блюда: (packaging, error_dict)."""
+    """Резолв упаковки при создании блюда: (packaging, error_dict).
+
+    Архив в новое блюдо не предлагаем — как и с ингредиентами. Сейчас все
+    28 упаковок активны, но правило должно работать и когда шеф что-то выведет.
+    """
     matches = data.search_packagings(name)
     if not matches:
         return None, {
@@ -644,6 +830,15 @@ def _resolve_packaging_for_create(data, name: str):
                 f"потом добавим в блюдо."
             )
         }
+    active = [p for p in matches if p.status != "архив"]
+    if not active:
+        return None, {
+            "error": (
+                f"Упаковка «{name}» в архиве — в новое блюдо не ставлю. "
+                f"Верни статус «активный» или назови другую."
+            )
+        }
+    matches = active
     q = name.lower().strip()
     for p in matches:
         if p.name.lower() == q:
@@ -654,6 +849,45 @@ def _resolve_packaging_for_create(data, name: str):
         "error": f"Несколько упаковок под «{name}» — уточни, какую",
         "candidates": [{"id": p.id, "name": p.name} for p in matches],
     }
+
+
+def _split_packaging_from_ingredients(data, ingredients: list, packaging: list):
+    """Вынуть из состава то, что на самом деле упаковка: (ingredients, packaging, notes).
+
+    LLM регулярно кладёт упаковку и в `packaging`, и в `ingredients` — тогда её
+    ищут в справочнике ING и диалог падает с «не найден в ING» или «укажи граммы»
+    (разбор лога 04.08.2026, два отказа подряд на ровном месте). Правило чинит
+    это в коде: решение детерминированное, промпту тут доверять нельзя.
+    """
+    known = {(p.get("name") or "").strip().lower() for p in packaging}
+    keep, extra, notes = [], [], []
+
+    for item in ingredients:
+        iname = (item.get("name") or "").strip()
+        if not iname:
+            keep.append(item)
+            continue
+
+        # Уже назвали упаковкой — просто выкидываем дубль, без шума
+        if iname.lower() in known:
+            continue
+
+        has_weight = item.get("grams") is not None or item.get("pieces") is not None
+        # Признак упаковки: нет веса, но есть qty (ключ из схемы упаковки),
+        # либо позиции нет в ING, зато она есть в листе «Упаковка».
+        looks_like_pkg = (not has_weight and item.get("qty") is not None) or (
+            not data.search_ingredients(iname) and data.search_packagings(iname)
+        )
+        if looks_like_pkg and data.search_packagings(iname):
+            qty = item.get("qty") or item.get("pieces") or 1
+            extra.append({"name": iname, "qty": qty})
+            known.add(iname.lower())
+            notes.append(f"«{iname}» учтён как упаковка, а не ингредиент")
+            continue
+
+        keep.append(item)
+
+    return keep, list(packaging) + extra, notes
 
 
 def _tool_create_dish(args: dict) -> dict:
@@ -668,16 +902,50 @@ def _tool_create_dish(args: dict) -> dict:
 
     if not name:
         return {"error": "Не указано название блюда (name)"}
-    if price_raw is None:
-        return {"error": "Не указана цена меню (price_menu)"}
     if not ingredients:
         return {"error": "Не указан состав (ingredients) — нужны пары ингредиент+граммы"}
-    try:
-        price_menu = Decimal(str(price_raw))
-    except Exception:
-        return {"error": f"Цена «{price_raw}» не похожа на число"}
-    if price_menu <= 0:
-        return {"error": "Цена меню должна быть больше нуля"}
+
+    # Цена меню НЕ обязательна. Шеф сначала считает фудкост и только потом
+    # назначает цену — требовать её заранее означало загонять его в тупик
+    # (04.08.2026: три отказа подряд на «мне надо знать FC чтобы посчитать»).
+    # Без цены считаем себестоимость, маржу не считаем — как и для 14 блюд,
+    # которые уже живут в таблице без цены.
+    if price_raw is None or str(price_raw).strip() == "":
+        price_menu = None
+    else:
+        try:
+            price_menu = Decimal(str(price_raw))
+        except Exception:
+            return {"error": f"Цена «{price_raw}» не похожа на число"}
+        if price_menu < 0:
+            return {"error": "Цена меню не может быть отрицательной"}
+        if price_menu == 0:
+            price_menu = None
+
+    # Категорию не даём выдумывать LLM: в логе одно блюдо получило сначала
+    # «Закуска», потом «Бургер», хотя шеф её не называл. Спрашиваем списком.
+    known_categories = data.dish_categories()
+    known_lower = {c.lower(): c for c, _ in known_categories}
+    if not category:
+        out = {"needs_category": True, "categories": known_categories}
+        out["display"] = format_category_prompt(name, known_categories)
+        return out
+    if category.lower() not in known_lower:
+        if not args.get("new_category"):
+            out = {
+                "needs_category": True,
+                "unknown_category": category,
+                "categories": known_categories,
+            }
+            out["display"] = format_category_prompt(name, known_categories, category)
+            return out
+    else:
+        # Приводим к написанию, которое уже есть в таблице («бургер» → «Бургер»)
+        category = known_lower[category.lower()]
+
+    ingredients, packaging, pkg_notes = _split_packaging_from_ingredients(
+        data, ingredients, packaging
+    )
 
     # id считаем по ЖИВОМУ листу — корректно после ручного удаления/правки
     new_id = data.next_free_dish_id_live()
@@ -749,7 +1017,7 @@ def _tool_create_dish(args: dict) -> dict:
     uc = calculate_uc_for_composition(data, new_id, name, price_menu, rows)
 
     # Дубль по названию не блокируем (решает шеф), но честно предупреждаем в превью
-    warnings = list(uc.warnings)
+    warnings = list(uc.warnings) + pkg_notes
     dup = next(
         (d for d in data.dishes.values() if d.name.lower() == name.lower()), None
     )
@@ -763,11 +1031,11 @@ def _tool_create_dish(args: dict) -> dict:
         "dish_id": new_id,
         "dish_name": name,
         "category": category,
-        "price_menu_rub": float(price_menu),
+        "price_menu_rub": opt_float(price_menu),
         "uc_rub": float(uc.uc_rub),
-        "uc_percent": float(uc.uc_percent),
-        "margin_rub": float(uc.margin_rub),
-        "margin_percent": float(uc.margin_percent),
+        "uc_percent": opt_float(uc.uc_percent),
+        "margin_rub": opt_float(uc.margin_rub),
+        "margin_percent": opt_float(uc.margin_percent),
         "output_grams": float(uc.output_grams),
         "ingredients": [
             {
@@ -787,6 +1055,9 @@ def _tool_create_dish(args: dict) -> dict:
             for i in uc.ingredients
         ],
         "warnings": warnings,
+        # Упаковка есть у всех 126 блюд с составом — если её не назвали, это
+        # почти наверняка забыли. Превью спросит об этом до записи (format.py).
+        "packaging_missing": not packaging,
     }
 
     if not confirm:
@@ -816,6 +1087,8 @@ TOOL_HANDLERS = {
     "simulate_price_change": _tool_simulate_price_change,
     "simulate_replacement": _tool_simulate_replacement,
     "generate_ttk_document": _tool_generate_ttk_document,
+    "generate_ttk_batch": _tool_generate_ttk_batch,
+    "build_pricing_table": _tool_build_pricing_table,
     "create_dish": _tool_create_dish,
     "reload_database": _tool_reload_database,
 }
@@ -911,8 +1184,11 @@ def chat(user_message: str, user_id: int | None = None) -> ChatResult:
                     logger.exception(f"Ошибка в tool {name}: {e}")
                     result = {"error": f"Ошибка выполнения: {e}"}
 
-            if isinstance(result, dict) and result.get("file_path"):
-                files.append(result["file_path"])
+            if isinstance(result, dict):
+                if result.get("file_path"):
+                    files.append(result["file_path"])
+                # Пакетная генерация возвращает список путей
+                files.extend(result.get("file_paths") or [])
 
             logger.info(f"Tool {name}({args}) → {str(result)[:200]}")
             messages.append({
