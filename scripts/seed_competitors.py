@@ -17,7 +17,7 @@ if sys.stdout.encoding.lower() not in ("utf-8", "utf8"):
 # а httpx получает SSR-страницу с ценами (см. profiles.py).
 SEED = [
     ("Додо Пицца", "dodopizza.ru", "https://dodopizza.ru/moscow", "playwright"),
-    ("Бургер Кинг", "burgerkingrus.ru", "https://burgerkingrus.ru/menu", "manual"),
+    ("Бургер Кинг", "burgerkingrus.ru", "https://burgerkingrus.ru/", "cdp"),
     ("Вкусно и точка", "vkusnoitochka.ru", "https://vkusnoitochka.ru/menu", "playwright"),
     # Именно cofix.global: на cofix.ru меню не отдаётся, запись по нему заархивирована
     ("Cofix", "cofix.global", "https://msk.cofix.global/", "playwright"),

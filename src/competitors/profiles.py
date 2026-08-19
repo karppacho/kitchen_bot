@@ -136,6 +136,12 @@ PROFILES: dict[str, SiteProfile] = {
             ("smartcaptcha", _LAVKA_CAPTCHA),
         ),
     ),
+    # Бургер Кинг: WAF Servicepipe режет Playwright (403 Forbidden), но живой
+    # браузер через cdp пускает — проверено 19.08.2026 с российского VPS.
+    # Главная страница сама по себе меню: ~278 цен, как у Додо и Cofix.
+    # Категории /category/NN дают ещё больше, но упираются в потолок символов
+    # и стоят вчетверо дороже по LLM — при нехватке позиций включить их через
+    # category_selector='a[href*="/category/"]'.
     "burgerkingrus.ru": SiteProfile(
         use_profile=True,
     ),
