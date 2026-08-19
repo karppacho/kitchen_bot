@@ -34,6 +34,12 @@ BLOCK_MARKERS = (
 # Меньше этого текста на странице меню не бывает — считаем, что нас не пустили
 DEFAULT_MIN_CHARS = 500
 
+# Столько упоминаний рубля должно быть на настоящей странице меню
+DEFAULT_MIN_PRICES = 10
+
+# По чему считаем цены
+PRICE_MARKERS = ("₽", "руб")
+
 # Коды состояния страницы (что вернул classify_page)
 PAGE_OK = "ok"
 PAGE_BLOCKED = "blocked"
@@ -71,6 +77,9 @@ class SiteProfile:
     state_markers: tuple[tuple[str, str], ...] = ()
 
     min_chars: int = DEFAULT_MIN_CHARS
+    # Страница меню пестрит ценами: у рабочих сайтов их 237–343. Если цен
+    # почти нет — это не меню, каким бы длинным ни был текст.
+    min_prices: int = DEFAULT_MIN_PRICES
 
     # Меню разбито на подстраницы категорий: обходим их в той же сессии.
     category_selector: str | None = None
@@ -93,8 +102,9 @@ _LAVKA_BAD_CATEGORY = (
 )
 
 _LAVKA_CAPTCHA = (
-    "Яндекс показал SmartCaptcha — он детектирует Playwright (и headless, и с окном). "
-    "Лавка должна сниматься с fetch_method='http', проверь запись в базе"
+    "Яндекс показал SmartCaptcha. С домашнего адреса Лавку снимает обычный httpx, "
+    "а с датацентрового IP капча приходит и на http, и на cdp (проверено 19.08.2026 "
+    "на VPS). Значит дело в репутации адреса, а не в способе съёма"
 )
 
 PROFILES: dict[str, SiteProfile] = {
@@ -191,5 +201,15 @@ def classify_page(text: str, profile: SiteProfile = DEFAULT_PROFILE) -> tuple[st
 
     if len(text) < profile.min_chars:
         return PAGE_EMPTY, f"страница почти пустая (текст {len(text)} симв.)"
+
+    # Порога длины мало: 19.08.2026 ВкусВилл с сервера стабильно отдавал 621
+    # символ и 4 цены — формально «не пусто», а по сути огрызок страницы.
+    # Такой срез прошёл бы как ok и стал базой сравнения.
+    prices = sum(low.count(m) for m in PRICE_MARKERS)
+    if prices < profile.min_prices:
+        return PAGE_EMPTY, (
+            f"на странице почти нет цен ({prices}) — это огрызок, а не меню "
+            f"(текст {len(text)} симв.)"
+        )
 
     return PAGE_OK, None

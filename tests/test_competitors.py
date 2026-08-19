@@ -313,6 +313,25 @@ def test_classify_empty_and_ok():
     assert (code, reason) == (profiles.PAGE_OK, None)
 
 
+def test_classify_page_without_prices_is_not_a_menu():
+    """Огрызок страницы не должен проходить как меню.
+
+    Регресс 19.08.2026: ВкусВилл с сервера стабильно отдавал 621 символ и
+    4 упоминания рубля. Порога длины (500) не хватило — срез помечался ok
+    и стал бы базой сравнения, а на следующей неделе дал бы стену
+    «пропала из меню» по всему ассортименту.
+    """
+    ogryzok = chr(10).join(['Кухня ВкусВилл', 'Фильтры', 'Сортировка']
+                           + ['Суп 278 руб'] * 4) + 'х' * 500
+    code, reason = profiles.classify_page(ogryzok)
+    assert code == profiles.PAGE_EMPTY
+    assert 'почти нет цен' in reason
+
+    # настоящее меню тем же порогом не задевается
+    menu = chr(10).join(['Пепперони 359 ₽'] * 40)
+    assert profiles.classify_page(menu)[0] == profiles.PAGE_OK
+
+
 def test_classify_state_markers_win_over_length():
     """Заглушка Лавки короче min_chars — маркер обязан сработать первым."""
     assert len(LAVKA_DEMO_TEXT) < profiles.DEFAULT_MIN_CHARS
