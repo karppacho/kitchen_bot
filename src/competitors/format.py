@@ -11,6 +11,21 @@ from src.competitors.models import CheckSiteResult, Diff
 # Больше диффов на сайт в Telegram не показываем — полный список уходит в Sheets
 MAX_DIFFS_SHOWN = 15
 
+# Ручной срез старше этого — данные пора обновить (Бургер Кинг меняет меню чаще)
+STALE_AFTER_DAYS = 14
+
+
+def _waiting_line(r: CheckSiteResult) -> str:
+    """Строка про конкурента в ручном режиме — с возрастом последних данных."""
+    name = f"  • <b>{_esc(r.competitor_name)}</b>"
+    if r.stale_days is None:
+        return f"{name} — данных ещё нет, пришли сохранённый HTML страницы меню"
+    if r.stale_days == 0:
+        return f"{name} — данные свежие (сегодня)"
+    days = r.stale_days
+    mark = " ⚠️ пора обновить" if days >= STALE_AFTER_DAYS else ""
+    return f"{name} — последние данные {days} дн. назад{mark}"
+
 
 def _esc(s) -> str:
     return html.escape(str(s), quote=False)
@@ -39,9 +54,15 @@ def format_check_summary(results: list[CheckSiteResult], when: datetime) -> str:
     """Сводка прогона: по сайтам — изменения; отдельным блоком — кто не проверился."""
     lines: list[str] = [f"<b>Мониторинг конкурентов — {when.strftime('%d.%m.%Y')}</b>", ""]
     failed: list[str] = []
+    waiting: list[str] = []
 
     for r in results:
-        if r.status in ("fetch_failed", "extract_failed", "skipped"):
+        # Ручной режим — это не сбой, а ожидание файла от шефа. В одной куче
+        # с настоящими поломками он выглядел как вечная ошибка, и его перестали замечать.
+        if r.status == "skipped":
+            waiting.append(_waiting_line(r))
+            continue
+        if r.status in ("fetch_failed", "extract_failed"):
             failed.append(f"  • {_esc(r.competitor_name)} ({_esc(r.competitor_url)}) — {_esc(r.error or r.status)}")
             continue
 
@@ -63,6 +84,12 @@ def format_check_summary(results: list[CheckSiteResult], when: datetime) -> str:
         lines.extend(_diff_line(d) for d in shown)
         if n > MAX_DIFFS_SHOWN:
             lines.append(f"  … и ещё {n - MAX_DIFFS_SHOWN} изменений (полный список — в таблице)")
+        lines.append("")
+
+    if waiting:
+        lines.append("Обновляются вручную (сайт нас не пускает):")
+        lines.extend(waiting)
+        lines.append("Сохрани страницу меню (Ctrl+S) и пришли файл сюда.")
         lines.append("")
 
     if failed:

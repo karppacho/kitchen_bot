@@ -8,7 +8,7 @@ class Competitor(BaseModel):
     url: str                        # базовый домен — ключ для /add|/remove
     menu_url: str                   # конкретная страница меню (городская)
     city: str = "Москва"
-    fetch_method: str = "playwright"  # playwright | manual (dodo_api — задел на будущее)
+    fetch_method: str = "playwright"  # playwright | http (без браузера) | manual
     active: bool = True
     added_at: str = ""
 
@@ -26,6 +26,13 @@ class FetchResult(BaseModel):
     ok: bool
     text: str = ""
     error: str | None = None
+    # Машинный код причины: ok | blocked | needs_session | empty | error.
+    # blocked/needs_session не ретраятся — вторая попытка даст то же самое.
+    reason: str = "ok"
+    # Улики на случай неудачи: разбор Лавки 06.08.2026 начался с пустого места,
+    # потому что при fetch_failed не сохранялось вообще ничего.
+    html: str = ""
+    screenshot: bytes | None = None
 
 
 class Diff(BaseModel):
@@ -47,3 +54,5 @@ class CheckSiteResult(BaseModel):
     diffs: list[Diff] = Field(default_factory=list)
     error: str | None = None
     first_snapshot: bool = False    # первый срез — сравнивать не с чем
+    # Возраст последнего удачного среза в днях (ручной режим): None — срезов не было
+    stale_days: int | None = None

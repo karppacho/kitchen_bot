@@ -3,14 +3,16 @@ storage (sqlite на tmp_path), html_text. Сеть и LLM не нужны.
 
 Запуск: pytest tests/test_competitors.py
 """
+import asyncio
+import sys
 from decimal import Decimal
 
-from src.competitors import comparator, storage
+from src.competitors import comparator, fetcher, profiles, storage
 from src.competitors.comparator import diff_snapshots, norm_name
 from src.competitors.extractor import parse_items_json, parse_price, _split_chunks
 from src.competitors.format import format_check_summary
 from src.competitors.html_text import page_to_menu_text, read_uploaded_document
-from src.competitors.models import CheckSiteResult, Diff, ExtractedItem
+from src.competitors.models import CheckSiteResult, Competitor, Diff, ExtractedItem, FetchResult
 from src.config import settings
 
 PCT = Decimal("10")
@@ -19,6 +21,11 @@ RUB = Decimal("30")
 
 def _item(name, price=None, weight=None, category=None):
     return ExtractedItem(item=name, price_rub=price, weight=weight, category=category)
+
+
+async def _no_sleep(_seconds):
+    """Заглушка asyncio.sleep: пауза между попытками не нужна тесту."""
+    return None
 
 
 # ---------- comparator ----------
@@ -164,7 +171,376 @@ def test_find_competitor(tmp_path, monkeypatch):
     assert storage.find_competitor("додо") is None
 
 
+def test_days_since_ok_snapshot(tmp_path, monkeypatch):
+    """Возраст считается по УДАЧНЫМ срезам: неудачная попытка не «освежает» данные."""
+    import sqlite3
+    from datetime import datetime, timedelta
+
+    monkeypatch.setattr(settings, "competitors_db_path", str(tmp_path / "test.db"))
+    comp = storage.add_competitor("Бургер Кинг", "burgerkingrus.ru",
+                                  "https://burgerkingrus.ru/menu", fetch_method="manual")
+    assert storage.days_since_ok_snapshot(comp.id) is None  # срезов ещё не было
+
+    snap_id = storage.save_snapshot(comp.id, [_item("Воппер", 359)], source="manual_html")
+    assert storage.days_since_ok_snapshot(comp.id) == 0
+
+    # состарим срез на 20 дней
+    old = (datetime.now() - timedelta(days=20)).isoformat(timespec="seconds")
+    with sqlite3.connect(tmp_path / "test.db") as conn:
+        conn.execute("UPDATE snapshots SET taken_at = ? WHERE id = ?", (old, snap_id))
+    assert storage.days_since_ok_snapshot(comp.id) == 20
+
+    # свежая НЕудачная попытка возраст не сбрасывает
+    storage.save_snapshot(comp.id, [], status="fetch_failed", error="403")
+    assert storage.days_since_ok_snapshot(comp.id) == 20
+
+
+def test_upsert_keeps_fetch_method(tmp_path, monkeypatch):
+    """Повторное /add_competitor не должно сбрасывать ручной режим в playwright.
+
+    Бот и tool manage_competitors зовут add_competitor без fetch_method —
+    раньше upsert подставлял дефолт, и Бургер Кинг молча терял 'manual'.
+    """
+    monkeypatch.setattr(settings, "competitors_db_path", str(tmp_path / "test.db"))
+    storage.add_competitor(
+        "Бургер Кинг", "burgerkingrus.ru", "https://burgerkingrus.ru/menu",
+        city="Питер", fetch_method="manual",
+    )
+    again = storage.add_competitor(
+        "Бургер Кинг", "burgerkingrus.ru", "https://burgerkingrus.ru/menu",
+    )
+    assert again.fetch_method == "manual"
+    assert again.city == "Питер"
+    # явная передача по-прежнему работает
+    changed = storage.add_competitor(
+        "Бургер Кинг", "burgerkingrus.ru", "https://burgerkingrus.ru/menu",
+        fetch_method="playwright",
+    )
+    assert changed.fetch_method == "playwright"
+    # у нового конкурента — прежние дефолты
+    fresh = storage.add_competitor("Додо", "dodopizza.ru", "https://dodopizza.ru/moscow")
+    assert (fresh.fetch_method, fresh.city) == ("playwright", "Москва")
+
+
+# ---------- profiles: классификация того, что сняли со страницы ----------
+
+# Живой текст lavka.yandex.ru от 06.08.2026 без выбранного адреса (291 симв.).
+LAVKA_DEMO_TEXT = (
+    "Ещё больше скидок и новых функций — в приложении Лавки\n"
+    "Перейти\n"
+    "Категория не существует\n"
+    "На главный экран\n"
+    "Это демо-каталог. Укажите адрес, чтобы посмотреть настоящий\n"
+    "5–10 мин, 0 ₽\n"
+    "Доставка бесплатно, а это всегда приятно\n"
+    "В корзине пока ничего нет.\n"
+)
+
+# Живая заглушка burgerkingrus.ru (Servicepipe), data/recon/burgerking.txt
+BK_BLOCK_TEXT = (
+    "Forbidden\nDatetime: 2026-08-06 16:02:04 +0000\nIP: 79.139.160.8\nID: 42TiU56Q44Y1\n"
+    "Origin: https://burgerkingrus.ru\n"
+    "If you are not a bot, please copy the report and send it to our support team.\nCopy"
+)
+
+
+def test_classify_lavka_bad_category():
+    """«Категория не существует» — это НЕ ботозащита, а неверный menu_url.
+
+    Регресс на разбор 06.08.2026: бот на всё короткое отвечал «похоже на
+    ботозащиту» и уводил в неверную сторону.
+    """
+    code, reason = profiles.classify_page(LAVKA_DEMO_TEXT, profiles.get_profile("lavka.yandex.ru"))
+    assert code == profiles.PAGE_NEEDS_SESSION
+    assert "menu_url" in reason
+
+
+def test_classify_lavka_captcha():
+    """SmartCaptcha ловится маркером профиля и объясняет, что делать."""
+    text = "Вы не робот?\nПодтвердите, что запросы отправляли вы, а не робот\nYandex SmartCaptcha"
+    code, reason = profiles.classify_page(text, profiles.get_profile("lavka.yandex.ru"))
+    assert code == profiles.PAGE_NEEDS_SESSION
+    assert "http" in reason
+
+
+def test_classify_blocked():
+    code, reason = profiles.classify_page(BK_BLOCK_TEXT, profiles.get_profile("burgerkingrus.ru"))
+    assert code == profiles.PAGE_BLOCKED
+    assert "HTML" in reason
+
+
+# Живая капча samokat.ru от 08.08.2026 (Playwright, headless)
+SAMOKAT_CAPTCHA_TEXT = (
+    "Мы хотим убедиться, что имеем дело именно с вами, а не с ботом.\n"
+    "Пожалуйста, пройдите проверку, чтобы получить доступ к сайту.\n"
+    "2026-08-08 16:38:13 +0000\nВаш IP:\n79.139.175.107\nID запроса:\nDcVFFP10OiE1\n"
+    "Разверните картинку горизонтально\nЗачем потребовалась эта проверка?\n"
+    "Что-то в поведении вашего браузера привлекло наше внимание.\n"
+) * 4
+
+# Живой челлендж ozon.ru от 08.08.2026
+OZON_BLOCK_TEXT = (
+    "Antibot Challenge Page\nfab_chlg_20260808163642_01KZH3QQT3QVZ4NBBJS0AMX9Z1\n"
+    "Попробуйте:\nобновить страницу\nотключить расширения и вновь обновить страницу\n"
+)
+
+
+def test_classify_russian_block_pages():
+    """Русские заглушки обязаны ловиться: английских слов в них нет вовсе.
+
+    Капча Самоката — 1300 символов связного русского текста. С одними
+    английскими маркерами она проходила как нормальное меню, уезжала в LLM,
+    возвращала 0 позиций и становилась базой сравнения — а дальше шеф получал
+    стену «пропала из меню» по всему ассортименту.
+    """
+    assert len(SAMOKAT_CAPTCHA_TEXT) > profiles.DEFAULT_MIN_CHARS  # порог длины не спасёт
+    assert profiles.classify_page(SAMOKAT_CAPTCHA_TEXT)[0] == profiles.PAGE_BLOCKED
+    assert profiles.classify_page(OZON_BLOCK_TEXT)[0] == profiles.PAGE_BLOCKED
+
+
+def test_classify_finds_marker_after_header():
+    """Маркер ищется по всему тексту: у Ozon челлендж стоит ПОСЛЕ шапки сайта."""
+    page = "Каталог\nДоставка\nОплата\n" + "меню " * 1200 + "\nAntibot Challenge Page"
+    assert profiles.classify_page(page)[0] == profiles.PAGE_BLOCKED
+
+
+def test_classify_empty_and_ok():
+    code, reason = profiles.classify_page("Меню\nПепперони 359 ₽")
+    assert code == profiles.PAGE_EMPTY
+    assert "почти пустая" in reason
+
+    code, reason = profiles.classify_page("Пепперони 359 ₽\n" * 100)
+    assert (code, reason) == (profiles.PAGE_OK, None)
+
+
+def test_classify_state_markers_win_over_length():
+    """Заглушка Лавки короче min_chars — маркер обязан сработать первым."""
+    assert len(LAVKA_DEMO_TEXT) < profiles.DEFAULT_MIN_CHARS
+    code, _ = profiles.classify_page(LAVKA_DEMO_TEXT, profiles.get_profile("lavka.yandex.ru"))
+    assert code == profiles.PAGE_NEEDS_SESSION
+    # без профиля тот же текст — просто пустая страница
+    assert profiles.classify_page(LAVKA_DEMO_TEXT)[0] == profiles.PAGE_EMPTY
+
+
+def test_default_profile_for_unknown_site():
+    """Сайты вне реестра работают ровно как раньше."""
+    assert profiles.get_profile("dodopizza.ru") is profiles.DEFAULT_PROFILE
+
+
+# ---------- fetcher: диспетчер fetch_method (браузер не нужен) ----------
+
+def _competitor(fetch_method: str) -> Competitor:
+    return Competitor(id=1, name="Тест", url="test.ru", menu_url="https://test.ru/menu",
+                      fetch_method=fetch_method)
+
+
+def test_fetch_manual_does_not_launch_browser():
+    result = asyncio.run(fetcher.fetch(_competitor("manual")))
+    assert result.ok is False
+    assert result.reason == profiles.PAGE_BLOCKED
+    assert "ручной режим" in result.error
+
+
+def test_fetch_unknown_method():
+    result = asyncio.run(fetcher.fetch(_competitor("dodo_api")))
+    assert result.ok is False
+    assert result.reason == "error"
+    assert "dodo_api" in result.error
+
+
+def test_fetch_http_method_skips_browser(monkeypatch):
+    """fetch_method='http' обязан идти мимо Playwright.
+
+    Яндекс детектирует Playwright и отдаёт SmartCaptcha даже с видимым окном,
+    а голому httpx — нормальную страницу. Если диспетчер перепутает методы,
+    Лавка молча перестанет сниматься.
+    """
+    def boom(*a, **kw):
+        raise AssertionError("http-метод не должен запускать браузер")
+
+    monkeypatch.setattr(fetcher, "_fetch_playwright_generic", boom)
+    monkeypatch.setattr(
+        fetcher, "_fetch_http_sync",
+        lambda comp, profile: FetchResult(ok=True, text="Грудка куриная 342 ₽"),
+    )
+    result = asyncio.run(fetcher.fetch(_competitor("http")))
+    assert result.ok is True
+
+
+def test_fetch_cdp_without_chrome_gives_actionable_error(monkeypatch):
+    """Chrome не запущен → внятная подсказка, а не трейс. И без ретрая.
+
+    Вторая попытка через 5–10 с ничего не изменит: порт как не слушал,
+    так и не слушает.
+    """
+    monkeypatch.setattr(settings, "competitors_cdp_url", "http://localhost:59999")
+    result = asyncio.run(fetcher.fetch(_competitor("cdp")))
+    assert result.ok is False
+    assert result.reason == profiles.PAGE_NEEDS_SESSION
+    assert "chrome_debug" in result.error
+
+
+def test_fetch_cdp_does_not_close_foreign_browser(monkeypatch):
+    """Браузер шефа закрывать нельзя — только свою вкладку.
+
+    Иначе еженедельная проверка захлопывала бы ему рабочие окна.
+    """
+    closed = {"browser": False, "page": False}
+
+    class _Page:
+        url = "https://test.ru/menu"
+        async def goto(self, *a, **kw): pass
+        async def wait_for_load_state(self, *a, **kw): pass
+        async def mouse_wheel(self, *a): pass
+        async def content(self): return "<div>Борщ 227 ₽</div>" * 60
+        async def screenshot(self, **kw): return b""
+        async def close(self): closed["page"] = True
+        @property
+        def mouse(self):
+            class _M:
+                async def wheel(self, *a): pass
+            return _M()
+
+    class _Ctx:
+        async def new_page(self): return _Page()
+
+    class _Browser:
+        contexts = [_Ctx()]
+        async def close(self): closed["browser"] = True
+
+    class _Chromium:
+        async def connect_over_cdp(self, url): return _Browser()
+
+    class _PW:
+        chromium = _Chromium()
+        async def __aenter__(self): return self
+        async def __aexit__(self, *a): return False
+
+    monkeypatch.setattr(fetcher, "async_playwright", lambda: _PW(), raising=False)
+    monkeypatch.setitem(sys.modules, "playwright.async_api",
+                        type(sys)("playwright.async_api"))
+    sys.modules["playwright.async_api"].async_playwright = lambda: _PW()
+
+    result = asyncio.run(fetcher.fetch(_competitor("cdp")))
+    assert result.ok is True
+    assert closed["page"] is True, "свою вкладку закрыть обязаны"
+    assert closed["browser"] is False, "чужой браузер закрывать нельзя"
+
+
+def test_join_pages_keeps_every_page():
+    """Лимит символов делится между страницами — ни одна не пропадает молча.
+
+    Регресс: Самокат 09.08.2026 отдал ровно 60000 символов (потолок
+    MAX_TEXT_CHARS) одной первой категорией, и вторая, склеенная следом,
+    срезалась целиком — в срез не попало полменю.
+    """
+    from src.competitors.html_text import MAX_TEXT_CHARS
+
+    huge, small = "а" * MAX_TEXT_CHARS, "Борщ 227 ₽"
+    joined = fetcher._join_pages([huge, small])
+    assert len(joined) <= MAX_TEXT_CHARS
+    assert small in joined, "вторая страница обязана уцелеть"
+
+    # одна страница режется по общему потолку, как раньше
+    assert len(fetcher._join_pages([huge])) == MAX_TEXT_CHARS
+    assert fetcher._join_pages([]) == ""
+
+    # короткие страницы не режутся вовсе
+    pages = ["Пицца 359 ₽", "Кофе 199 ₽", "Суп 227 ₽"]
+    assert all(p in fetcher._join_pages(pages) for p in pages)
+
+
+def test_lavka_is_http_not_playwright():
+    """Профиль Лавки не должен звать браузер: у неё extra_urls, а не use_profile."""
+    lavka = profiles.get_profile("lavka.yandex.ru")
+    assert lavka.use_profile is False
+    assert lavka.extra_urls
+
+
+def test_fetch_does_not_retry_needs_session(monkeypatch):
+    """Вторая попытка через 5–10 с даст ровно тот же демо-каталог — не ходим дважды."""
+    calls = []
+
+    async def fake_generic(comp, headless):
+        calls.append(headless)
+        return FetchResult(ok=False, error="нужен адрес", reason=profiles.PAGE_NEEDS_SESSION)
+
+    monkeypatch.setattr(fetcher, "_fetch_playwright_generic", fake_generic)
+    result = asyncio.run(fetcher.fetch(_competitor("playwright"), headless=True))
+    assert result.reason == profiles.PAGE_NEEDS_SESSION
+    assert len(calls) == 1
+
+
+def test_fetch_retries_transient_error(monkeypatch):
+    calls = []
+
+    async def fake_generic(comp, headless):
+        calls.append(headless)
+        if len(calls) == 1:
+            raise TimeoutError("сеть моргнула")
+        return FetchResult(ok=True, text="Пепперони 359 ₽")
+
+    monkeypatch.setattr(fetcher, "_fetch_playwright_generic", fake_generic)
+    monkeypatch.setattr(fetcher.asyncio, "sleep", _no_sleep)
+    result = asyncio.run(fetcher.fetch(_competitor("playwright"), headless=True))
+    assert result.ok is True
+    assert len(calls) == 2
+
+
+# ---------- service: срез без цен не становится базой сравнения ----------
+
+def test_snapshot_without_prices_is_suspect(tmp_path, monkeypatch):
+    """Страница без единого упоминания рубля — не меню, что бы ни вернула LLM.
+
+    Страховка от заглушек, чьих формулировок ещё нет в BLOCK_MARKERS: они
+    короткие, и порог _SUSPECT_MIN_CHARS (5000) их пропускает. Такой срез
+    обязан получить статус suspect и НЕ стать базой сравнения — иначе
+    следующий прогон выдаст стену ложных «пропала из меню».
+    """
+    from src.competitors import service
+
+    monkeypatch.setattr(settings, "competitors_db_path", str(tmp_path / "test.db"))
+    comp = storage.add_competitor("Самокат", "samokat.ru", "https://samokat.ru/category/x")
+
+    # нормальный срез — база сравнения
+    good = [_item(f"Блюдо {i}", 100 + i) for i in range(20)]
+    service._process_snapshot_sync(comp, good, "Блюдо 1 — 359 ₽" * 40, None, "auto")
+    base_id = storage.latest_ok_snapshot(comp.id)[0]
+
+    # заглушка: мало позиций, текст короткий, ни одного «₽»/«руб»
+    res = service._process_snapshot_sync(
+        comp, [], "Пожалуйста, пройдите проверку, чтобы получить доступ", None, "auto",
+    )
+    assert res.status == "suspect"
+    assert storage.latest_ok_snapshot(comp.id)[0] == base_id  # база не сменилась
+    assert res.diffs == []                                    # и диффов не наплодили
+
+    # короткий, но настоящий срез с ценами suspect-ом НЕ становится
+    res = service._process_snapshot_sync(
+        comp, [_item("Борщ", 227)], "Борщ 227 ₽", None, "auto",
+    )
+    assert res.status == "ok"
+
+
 # ---------- html_text ----------
+
+def test_page_to_menu_text_strips_lavka_typography():
+    """Мягкие переносы и <notr> Лавки не должны попадать в название позиции.
+
+    Лавка расставляет U+00AD внутри каждого слова («тво\xadрож\xadный») и
+    оставляет служебный маркер «не переводить». Без чистки LLM тащит это
+    прямо в item, и одна позиция перестаёт матчиться сама с собой.
+    """
+    html = (
+        "<div>Мусс тво­рож­ный 125 г</div>"
+        "<div>Грудка куриная с пюре &lt;notr&gt;Из Лавки&lt;/notr&gt; 340 г</div>"
+    )
+    text = page_to_menu_text(html)
+    assert "Мусс творожный 125 г" in text
+    assert "Грудка куриная с пюре Из Лавки 340 г" in text
+    assert "notr" not in text
+    assert "­" not in text
+
 
 def test_page_to_menu_text_drops_chrome():
     html = """
@@ -206,8 +582,8 @@ def test_format_summary_escapes_and_reports_failures():
                         status="ok", items_count=150,
                         diffs=[Diff(change_type="price_up", item="Пепперони", old_price=359,
                                     new_price=399, delta_rub=40, delta_percent=11.1)]),
-        CheckSiteResult(competitor_name="Бургер Кинг", competitor_url="burgerkingrus.ru",
-                        status="skipped", error="ручной режим — пришли сохранённый HTML"),
+        CheckSiteResult(competitor_name="Вкусно и точка", competitor_url="vkusnoitochka.ru",
+                        status="fetch_failed", error="таймаут"),
         CheckSiteResult(competitor_name="Cofix", competitor_url="cofix.ru",
                         status="ok", items_count=80, first_snapshot=True),
     ]
@@ -216,8 +592,30 @@ def test_format_summary_escapes_and_reports_failures():
     assert "&lt;Пицца&gt;" in text                     # HTML экранируется
     assert "359 → 399 ₽ (+40 ₽, +11.1%)" in text       # числа собраны Python-ом
     assert "Не смог проверить:" in text
-    assert "ручной режим" in text
+    assert "таймаут" in text
     assert "первый срез" in text
+
+
+def test_manual_competitor_is_not_a_failure():
+    """Ручной режим — ожидание файла, а не поломка: отдельный блок и возраст данных.
+
+    В общей куче «Не смог проверить» Бургер Кинг выглядел вечной ошибкой,
+    и его переставали замечать — вместе с тем, что данные протухли.
+    """
+    from datetime import datetime
+    fresh = CheckSiteResult(competitor_name="Бургер Кинг", competitor_url="burgerkingrus.ru",
+                            status="skipped", error="ручной режим", stale_days=3)
+    text = format_check_summary([fresh], datetime(2026, 7, 20))
+    assert "Обновляются вручную" in text
+    assert "Не смог проверить" not in text
+    assert "3 дн. назад" in text
+    assert "пора обновить" not in text
+
+    stale = fresh.model_copy(update={"stale_days": 40})
+    assert "пора обновить" in format_check_summary([stale], datetime(2026, 7, 20))
+
+    never = fresh.model_copy(update={"stale_days": None})
+    assert "данных ещё нет" in format_check_summary([never], datetime(2026, 7, 20))
 
 
 # ---------- кому уходит сводка ----------

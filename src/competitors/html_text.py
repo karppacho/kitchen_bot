@@ -1,6 +1,7 @@
 """HTML → чистый текст меню. Плюс разбор .mhtml для ручного фолбэка."""
 import email
 import email.policy
+import re
 from pathlib import Path
 
 from bs4 import BeautifulSoup
@@ -11,13 +12,24 @@ MAX_TEXT_CHARS = 60_000
 _DROP_TAGS = ("script", "style", "noscript", "svg", "iframe", "template",
               "header", "footer", "nav")
 
+# Невидимая типографика, которой вёрстка рвёт слова. Лавка расставляет мягкие
+# переносы внутри каждого названия («тво\xadрож\xadный»), и без чистки одна и та
+# же позиция выглядит по-разному для матчинга, а LLM копирует мусор в item.
+_INVISIBLE = str.maketrans({"­": None, "​": None, "‌": None,
+                            "‍": None, "﻿": None})
+
+# Экранированный служебный маркер Яндекса «не переводить»: в тексте Лавки он
+# приезжает буквально — «Грудка куриная с пюре <notr>Из Лавки</notr> 340 г»,
+# и LLM тащит его прямо в название позиции.
+_NOTR_RE = re.compile(r"</?notr>")
+
 
 def page_to_menu_text(html: str) -> str:
     """Основной текстовый контент страницы: без скриптов, навигации и пустых строк."""
     soup = BeautifulSoup(html, "html.parser")
     for tag in soup(_DROP_TAGS):
         tag.decompose()
-    text = soup.get_text("\n")
+    text = _NOTR_RE.sub("", soup.get_text("\n").translate(_INVISIBLE))
     lines = [ln.strip() for ln in text.split("\n")]
     cleaned = "\n".join(ln for ln in lines if ln)
     return cleaned[:MAX_TEXT_CHARS]

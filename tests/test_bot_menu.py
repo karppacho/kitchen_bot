@@ -5,6 +5,8 @@
 @dp.message(F.text). Иначе подписи вроде «🔄 Обновить данные» уйдут в LLM как
 обычный вопрос, и кнопки молча перестанут работать.
 """
+import time
+
 import pytest
 
 from src.bot import keyboards as kb
@@ -49,6 +51,112 @@ def test_every_button_has_an_action():
 def test_every_action_is_callable():
     for label, handler in main.BUTTON_ACTIONS.items():
         assert callable(handler), f"для «{label}» не корутина"
+
+
+# ---------- двухшаговое добавление конкурента ----------
+# Формат «/add_competitor <url>» в Telegram нерабочий: команда из меню уходит
+# сразу, дописать аргумент некуда. Поэтому команда переводит в режим ожидания.
+
+class _FakeUser:
+    def __init__(self, uid):
+        self.id, self.username, self.full_name = uid, "chef", "chef"
+
+
+class _FakeMsg:
+    def __init__(self, text, uid):
+        self.text, self.from_user = text, _FakeUser(uid)
+
+
+def _uid() -> int:
+    from src.config import settings
+    return settings.telegram_allowed_user_ids[0]
+
+
+def test_pending_filter_off_by_default():
+    """Без ожидания обычные сообщения должны доходить до LLM, а не сюда."""
+    from src.bot import competitors as cc
+    cc.clear_pending(_uid())
+    assert cc.is_awaiting_link(_FakeMsg("сколько стоит чизбургер", _uid())) is False
+
+
+def test_pending_filter_on_after_command():
+    from src.bot import competitors as cc
+    cc._set_pending(_uid(), "add")
+    assert cc.is_awaiting_link(_FakeMsg("dodopizza.ru", _uid())) is True
+    cc.clear_pending(_uid())
+
+
+def test_pending_filter_ignores_commands():
+    """Пока ждём ссылку, команды обязаны работать как обычно."""
+    from src.bot import competitors as cc
+    cc._set_pending(_uid(), "add")
+    assert cc.is_awaiting_link(_FakeMsg("/refresh", _uid())) is False
+    cc.clear_pending(_uid())
+
+
+def test_pending_filter_ignores_other_users():
+    from src.bot import competitors as cc
+    cc._set_pending(_uid(), "add")
+    assert cc.is_awaiting_link(_FakeMsg("dodopizza.ru", 999999)) is False
+    cc.clear_pending(_uid())
+
+
+def test_pending_expires(monkeypatch):
+    from src.bot import competitors as cc
+    cc._set_pending(_uid(), "add")
+    later = time.time() + cc._PENDING_TTL + 1
+    monkeypatch.setattr(cc.time, "time", lambda: later)
+    assert cc.is_awaiting_link(_FakeMsg("dodopizza.ru", _uid())) is False
+
+
+def test_pending_answer_registered_before_catch_all():
+    """Иначе присланная ссылка уйдёт в LLM как обычный вопрос."""
+    names = _handler_names()
+    assert names.index("on_pending_answer") < names.index("on_text")
+
+
+def test_help_no_longer_documents_broken_format():
+    """«/add_competitor <url>» через меню невозможен — не обещаем его шефу."""
+    assert "/add_competitor <url>" not in main.HELP_TEXT
+    assert "ссылку следующим сообщением" in main.HELP_TEXT
+
+
+# ---------- справка /start ----------
+
+def test_help_text_is_valid_telegram_html():
+    """Голые & < > ломают разбор HTML — Telegram отдаст ошибку вместо справки."""
+    import re
+    text = main.HELP_TEXT
+    assert not re.search(r"&(?!amp;|lt;|gt;|quot;|#)", text), "неэкранированный &"
+    assert not re.findall(r"[<>]", re.sub(r"</?b>", "", text)), "голые угловые скобки"
+    assert text.count("<b>") == text.count("</b>"), "непарные теги"
+
+
+def test_help_text_chunks_fit_telegram_limit():
+    """Справка длинная — куски должны влезать, а теги не рваться между ними."""
+    from src.bot.telegram_text import TELEGRAM_MAX_LEN, split_for_telegram
+    for chunk in split_for_telegram(main.HELP_TEXT):
+        assert len(chunk) <= TELEGRAM_MAX_LEN
+        assert chunk.count("<b>") == chunk.count("</b>")
+
+
+def test_help_text_covers_every_command():
+    """Команда, не описанная в справке, для шефа не существует."""
+    for command in ("/refresh", "/new", "/pricing", "/help"):
+        assert command in main.HELP_TEXT, f"{command} не описана в справке"
+
+
+def test_help_text_covers_key_features():
+    """Каждая крупная фича должна быть названа — иначе о ней никто не узнает."""
+    for marker in ("ПОСЧИТАТЬ", "ЧТО ЕСЛИ", "ПРИДУМАТЬ", "ЗАВЕСТИ БЛЮДО",
+                   "ТЕХНОЛОГИЧЕСКИЕ КАРТЫ", "РАСЧЁТКА", "КОНКУРЕНТЫ"):
+        assert marker in main.HELP_TEXT, f"в справке нет раздела «{marker}»"
+
+
+def test_help_text_states_trust_rules():
+    """Главные обещания бота: числа из калькулятора и запись только по «да»."""
+    assert "калькулятор" in main.HELP_TEXT
+    assert "подтверждения" in main.HELP_TEXT
 
 
 def test_bot_commands_are_valid():

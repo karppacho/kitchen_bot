@@ -370,6 +370,84 @@ def format_category_prompt(
     return "\n\n".join(parts)
 
 
+def format_dish_ideas(ideas: list, mode: str) -> str:
+    """display для идей блюд.
+
+    Все цифры здесь — из калькулятора. Модель придумала только название,
+    концепцию и граммовки; про граммовки это прямо проговаривается, чтобы шеф
+    не принял их за выверенную закладку.
+    """
+    parts: list[str] = []
+
+    for n, idea in enumerate(ideas, start=1):
+        head = [f"{n}. {_esc(idea.name)}"]
+        if idea.idea:
+            head.append(_esc(idea.idea))
+        if idea.category:
+            head.append(f"Категория: {_esc(idea.category)}")
+        block = ["\n".join(head)]
+
+        rows = []
+        for ing in idea.ingredients:
+            shown = ing.matched_name or ing.name
+            mark = "" if ing.known else "  (нет в базе)"
+            weight = f"{_num(ing.grams, 0)} г"
+            # У позиции без цены ставим прочерк, а не «0.00 ₽»: ноль читается
+            # как «бесплатно», хотя на деле цены просто нет в базе.
+            cost = "—"
+            if idea.uc is not None and ing.costed:
+                found = next(
+                    (i for i in idea.uc.ingredients if i.name == ing.matched_name), None
+                )
+                if found is not None:
+                    cost = f"{_num(found.cost_rub)} {RUB}"
+            rows.append([str(shown)[:26] + mark, weight, cost])
+        if rows:
+            block.append(_table(["Состав", "Вес", "Стоим."], rows, ["l", "r", "r"]))
+
+        if idea.uc is not None:
+            tail = (
+                f"Выход: {_num(idea.uc.output_grams, 0)} г  |  "
+                f"КБЖУ: Б {_num(idea.uc.proteins_g, 1)} / Ж {_num(idea.uc.fats_g, 1)} / "
+                f"У {_num(idea.uc.carbs_g, 1)} / {_num(idea.uc.kcal, 0)} ккал"
+            )
+            if idea.costed_count == 0:
+                # «Себестоимость 0.00 ₽» — технически верно и совершенно
+                # бесполезно: шеф прочитает ноль как настоящий. Тот же принцип,
+                # что и с маржой при незаполненной цене меню.
+                block.append(tail)
+                block.append(
+                    "Себестоимость посчитать не могу — ни у одного ингредиента "
+                    "в базе нет цены. Проставь цены в ING и повтори."
+                )
+            else:
+                block.append(f"Себестоимость: {_num(idea.uc.uc_rub)} {RUB}  |  " + tail)
+                if not idea.full_coverage:
+                    block.append(
+                        f"Себестоимость посчитана по {idea.costed_count} из "
+                        f"{len(idea.ingredients)} позиций — у остальных в базе нет цены, "
+                        f"реальный UC будет выше."
+                    )
+        if idea.to_buy:
+            block.append("Нужно закупить и завести в ING: " + ", ".join(
+                _esc(x) for x in idea.to_buy
+            ))
+        for note in idea.notes:
+            block.append(f"Замечание: {_esc(note)}")
+
+        parts.append("\n\n".join(block))
+
+    tail = [
+        "Граммовки предварительные — поправь при создании блюда.",
+        "Понравился вариант — скажи «создай первый» (или второй, третий), "
+        "посчитаю точно и запишу в таблицу.",
+    ]
+    if mode == "новое":
+        tail.insert(0, "Позиции с пометкой «нет в базе» в себестоимость не вошли.")
+    parts.append("\n".join(tail))
+    return "\n\n".join(parts)
+
+
 def format_ttk_batch_preview(status: str, ready: list, skipped: list) -> str:
     """display для ПРЕВЬЮ пачки ТТК: что войдёт, что пропустим."""
     title = "новинкам (статус «разработка»)" if status == "разработка" else f"блюдам «{status}»"

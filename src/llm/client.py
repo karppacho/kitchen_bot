@@ -658,6 +658,122 @@ def _tool_generate_ttk_document(args: dict) -> dict:
     return {"display": display, "file_path": str(out_path)}
 
 
+def _tool_manage_competitors(args: dict) -> dict:
+    """Список конкурентов, добавить, убрать.
+
+    Шеф пишет живым языком («добавь конкурента <ссылка>»), а не командой
+    /add_competitor — 06.08.2026 бот на такую фразу ответил «это не входит
+    в мои функции», хотя умеет. Проверку прогоном сюда не тащим: она идёт
+    3–8 минут в фоне, для неё есть команда и кнопка.
+    """
+    from urllib.parse import urlparse
+
+    from src.competitors import storage
+
+    action = (args.get("action") or "list").strip().lower()
+
+    if action in ("list", "список"):
+        comps = storage.list_competitors()
+        return {
+            "count": len(comps),
+            "competitors": [
+                {"name": c.name, "url": c.url, "fetch_method": c.fetch_method}
+                for c in comps
+            ],
+        }
+
+    raw = (args.get("url") or "").strip()
+    if not raw:
+        return {"error": "Не указана ссылка на сайт конкурента"}
+    if not raw.startswith(("http://", "https://")):
+        raw = "https://" + raw
+    parsed = urlparse(raw)
+    if not parsed.netloc or "." not in parsed.netloc:
+        return {"error": f"«{args.get('url')}» не похоже на адрес сайта"}
+    domain = parsed.netloc.removeprefix("www.")
+
+    if action in ("remove", "delete", "убрать", "удалить"):
+        comp = storage.deactivate_competitor(domain)
+        if comp is None:
+            return {"error": f"Конкурента с адресом {domain} не отслеживаю"}
+        return {"removed": comp.name, "url": comp.url}
+
+    if action not in ("add", "добавить"):
+        return {"error": f"Не понял действие «{action}». Бывает: add, remove, list."}
+
+    name = (args.get("name") or "").strip() or domain
+    comp = storage.add_competitor(name, domain, raw)
+    logger.info(f"[конкуренты] добавлен {comp.name} ({comp.url}) через LLM")
+    return {
+        "added": comp.name,
+        "url": comp.url,
+        "menu_url": comp.menu_url,
+        "note": (
+            "Проверю в ближайший еженедельный прогон. Запустить сейчас — "
+            "команда /check_competitors или кнопка «Проверить сейчас»."
+        ),
+    }
+
+
+def _tool_suggest_dishes(args: dict, user_id: int | None = None) -> dict:
+    """Идеи новых блюд. Модель придумывает состав, числа считает калькулятор.
+
+    user_id нужен, чтобы не предлагать одно и то же на «давай ещё» (см. recent.py).
+    """
+    from src.ideas import recent
+    from src.ideas.generator import MODE_FROM_BASE, MODE_NEW, generate_ideas
+    from src.llm.format import format_dish_ideas
+
+    data = get_data()
+    brief = (args.get("brief") or "").strip()
+
+    raw_mode = (args.get("mode") or "").strip().lower()
+    mode = MODE_NEW if raw_mode in ("новое", "новые", "с закупкой") else MODE_FROM_BASE
+
+    category = (args.get("category") or "").strip() or None
+    target_raw = args.get("target_uc")
+    target_uc = None
+    if target_raw not in (None, ""):
+        try:
+            target_uc = Decimal(str(target_raw))
+        except Exception:
+            target_uc = None
+
+    try:
+        count = int(args.get("count") or settings.ideas_count)
+    except (TypeError, ValueError):
+        count = settings.ideas_count
+    count = max(1, min(count, 5))
+
+    ideas, error = generate_ideas(
+        data, brief, _llm_complete,
+        mode=mode, category=category, target_uc=target_uc,
+        count=count, temperature=settings.ideas_temperature,
+        avoid=recent.recent(user_id),
+    )
+    if error:
+        return {"error": error}
+
+    recent.remember(user_id, [i.name for i in ideas])
+
+    return {
+        "mode": mode,
+        "count": len(ideas),
+        # Машиночитаемая часть: по ней модель вызовет create_dish, когда шеф
+        # выберет вариант. Числа отсюда в ответ не идут — только из display.
+        "variants": [
+            {
+                "n": n,
+                "name": idea.name,
+                "category": idea.category,
+                "ingredients": idea.as_create_dish_payload(),
+            }
+            for n, idea in enumerate(ideas, start=1)
+        ],
+        "display": format_dish_ideas(ideas, mode),
+    }
+
+
 def _tool_build_pricing_table(args: dict) -> dict:
     """Пересборка расчётки для коммерческого отдела."""
     from src.pricing.format import format_pricing_result
@@ -1078,6 +1194,9 @@ def _tool_create_dish(args: dict) -> dict:
     return result
 
 
+# Инструменты, которым нужен user_id: вызываются как handler(args, user_id).
+USER_AWARE_TOOLS = {"suggest_dishes"}
+
 TOOL_HANDLERS = {
     "calculate_dish_uc": _tool_calculate_dish_uc,
     "list_dishes": _tool_list_dishes,
@@ -1089,6 +1208,8 @@ TOOL_HANDLERS = {
     "generate_ttk_document": _tool_generate_ttk_document,
     "generate_ttk_batch": _tool_generate_ttk_batch,
     "build_pricing_table": _tool_build_pricing_table,
+    "suggest_dishes": _tool_suggest_dishes,
+    "manage_competitors": _tool_manage_competitors,
     "create_dish": _tool_create_dish,
     "reload_database": _tool_reload_database,
 }
@@ -1179,7 +1300,13 @@ def chat(user_message: str, user_id: int | None = None) -> ChatResult:
                 result = {"error": f"Неизвестная функция: {name}"}
             else:
                 try:
-                    result = handler(args)
+                    # Явный список, а не скрытый ключ в args: видно, кто зависит
+                    # от пользователя. Пока это только идеи — им нужна память,
+                    # чтобы не предлагать одно и то же на «давай ещё».
+                    if name in USER_AWARE_TOOLS:
+                        result = handler(args, user_id)
+                    else:
+                        result = handler(args)
                 except Exception as e:
                     logger.exception(f"Ошибка в tool {name}: {e}")
                     result = {"error": f"Ошибка выполнения: {e}"}

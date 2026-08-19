@@ -23,6 +23,12 @@ _check_lock = asyncio.Lock()
 _SUSPECT_MIN_ITEMS = 5
 _SUSPECT_MIN_CHARS = 5000
 
+# Признаки того, что на странице вообще есть цены. Страница меню без единого
+# упоминания рубля — это не меню, а заглушка: так ловятся антибот-страницы,
+# формулировок которых ещё нет в BLOCK_MARKERS (порог _SUSPECT_MIN_CHARS их
+# пропускает, они короткие).
+_PRICE_MARKERS = ("₽", "руб")
+
 _RAW_DIR = Path("data/raw")
 
 ALREADY_RUNNING_MSG = "⏳ Проверка конкурентов уже идёт — дождись сводки."
@@ -32,13 +38,42 @@ def is_check_running() -> bool:
     return _check_lock.locked()
 
 
+def _raw_dir(comp: Competitor) -> Path:
+    domain = comp.url.replace("https://", "").replace("http://", "").strip("/").replace("/", "_")
+    path = _RAW_DIR / domain
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
 def _save_raw(comp: Competitor, text: str) -> str:
     """Сырой текст страницы — на диск: реэкстракция без повторного скрапа."""
-    domain = comp.url.replace("https://", "").replace("http://", "").strip("/").replace("/", "_")
-    path = _RAW_DIR / domain / f"{datetime.now():%Y%m%d_%H%M%S}.txt"
-    path.parent.mkdir(parents=True, exist_ok=True)
+    path = _raw_dir(comp) / f"{datetime.now():%Y%m%d_%H%M%S}.txt"
     path.write_text(text, encoding="utf-8")
     return str(path)
+
+
+def _save_failure(comp: Competitor, fr) -> str | None:
+    """Улики неудачного захода: текст, HTML, скриншот.
+
+    Раньше при fetch_failed не сохранялось НИЧЕГО — разбор Лавки 06.08.2026
+    начался с пустого места (в снимке raw_chars=NULL). Возвращает путь к .txt
+    для колонки snapshots.raw_path, чтобы из сводки можно было дойти до улик.
+    """
+    stem = _raw_dir(comp) / f"failed_{datetime.now():%Y%m%d_%H%M%S}"
+    txt_path: str | None = None
+    try:
+        if fr.text:
+            (stem.with_suffix(".txt")).write_text(fr.text, encoding="utf-8")
+            txt_path = str(stem.with_suffix(".txt"))
+        if fr.html:
+            (stem.with_suffix(".html")).write_text(fr.html, encoding="utf-8")
+        if fr.screenshot:
+            (stem.with_suffix(".png")).write_bytes(fr.screenshot)
+    except Exception as e:
+        logger.warning(f"[конкуренты] не сохранил улики {comp.url}: {type(e).__name__}: {e}")
+    if txt_path or fr.html or fr.screenshot:
+        logger.info(f"[конкуренты] улики неудачи {comp.url}: {stem}.*")
+    return txt_path
 
 
 def _filter_llm_flaps(diffs, new_raw_text: str, old_raw_path: str | None):
@@ -83,7 +118,9 @@ def _process_snapshot_sync(
         competitor_name=comp.name, competitor_url=comp.url,
         status="ok", items_count=len(items),
     )
-    if len(items) < _SUSPECT_MIN_ITEMS and len(raw_text) > _SUSPECT_MIN_CHARS:
+    few_items = len(items) < _SUSPECT_MIN_ITEMS
+    no_prices = not any(m in raw_text.lower() for m in _PRICE_MARKERS)
+    if few_items and (len(raw_text) > _SUSPECT_MIN_CHARS or no_prices):
         result.status = "suspect"
 
     prev = storage.latest_ok_snapshot(comp.id)
@@ -110,26 +147,33 @@ def _process_snapshot_sync(
     return result
 
 
-async def _check_one(comp: Competitor) -> CheckSiteResult:
+async def _check_one(comp: Competitor, headless: bool | None = None) -> CheckSiteResult:
     loop = asyncio.get_running_loop()
     failed = CheckSiteResult(competitor_name=comp.name, competitor_url=comp.url, status="ok")
 
     if comp.fetch_method == "manual":
         failed.status = "skipped"
         failed.error = "ручной режим — пришли сохранённый HTML страницы меню"
-        return failed
-
-    fr = await fetcher.fetch(comp)
-    if not fr.ok:
-        failed.status = "fetch_failed"
-        failed.error = fr.error
-        await loop.run_in_executor(
-            None,
-            lambda: storage.save_snapshot(comp.id, [], status="fetch_failed", error=fr.error),
+        failed.stale_days = await loop.run_in_executor(
+            None, storage.days_since_ok_snapshot, comp.id,
         )
         return failed
 
-    raw_path = _save_raw(comp, fr.text)
+    fr = await fetcher.fetch(comp, headless)
+    if not fr.ok:
+        failed.status = "fetch_failed"
+        failed.error = fr.error
+        evidence = await loop.run_in_executor(None, _save_failure, comp, fr)
+        await loop.run_in_executor(
+            None,
+            lambda: storage.save_snapshot(
+                comp.id, [], status="fetch_failed", raw_chars=len(fr.text),
+                raw_path=evidence, error=fr.error,
+            ),
+        )
+        return failed
+
+    raw_path = await loop.run_in_executor(None, _save_raw, comp, fr.text)
     try:
         items, _meta = await loop.run_in_executor(None, extractor.extract_menu, fr.text, comp.name)
     except Exception as e:
@@ -158,6 +202,7 @@ async def run_check(
     notify: bool = True,
     export: bool = True,
     notify_user_id: int | None = None,
+    headless: bool | None = None,
 ) -> str:
     """Полный прогон по активным конкурентам. Возвращает текст сводки.
 
@@ -184,7 +229,7 @@ async def run_check(
         for i, comp in enumerate(comps):
             if i > 0:
                 await fetcher.pause_between_sites()
-            results.append(await _check_one(comp))
+            results.append(await _check_one(comp, headless))
 
         summary = format_check_summary(results, started)
 

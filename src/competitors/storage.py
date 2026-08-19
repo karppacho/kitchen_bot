@@ -95,23 +95,29 @@ def add_competitor(
     name: str,
     url: str,
     menu_url: str,
-    city: str = "Москва",
-    fetch_method: str = "playwright",
+    city: str | None = None,
+    fetch_method: str | None = None,
 ) -> Competitor:
-    """Добавить конкурента. Если url уже есть (в т.ч. деактивированный) — обновить и включить."""
+    """Добавить конкурента. Если url уже есть (в т.ч. деактивированный) — обновить и включить.
+
+    city и fetch_method обновляются, ТОЛЬКО если переданы явно. Иначе повторное
+    /add_competitor по существующему сайту сбрасывало бы ручной режим обратно
+    в playwright: бот (src/bot/competitors.py) и tool manage_competitors зовут
+    эту функцию без них, и Бургер Кинг молча терял бы свой fetch_method='manual'.
+    """
     with _connect() as conn:
         conn.execute(
             """
             INSERT INTO competitors (name, url, menu_url, city, fetch_method, active, added_at)
-            VALUES (?, ?, ?, ?, ?, 1, ?)
+            VALUES (?, ?, ?, COALESCE(?, 'Москва'), COALESCE(?, 'playwright'), 1, ?)
             ON CONFLICT(url) DO UPDATE SET
                 name = excluded.name,
                 menu_url = excluded.menu_url,
-                city = excluded.city,
-                fetch_method = excluded.fetch_method,
+                city = COALESCE(?, competitors.city),
+                fetch_method = COALESCE(?, competitors.fetch_method),
                 active = 1
             """,
-            (name, url, menu_url, city, fetch_method, _now()),
+            (name, url, menu_url, city, fetch_method, _now(), city, fetch_method),
         )
         row = conn.execute("SELECT * FROM competitors WHERE url = ?", (url,)).fetchone()
     return _row_to_competitor(row)
@@ -214,6 +220,28 @@ def latest_ok_snapshot(
         if row is None:
             return None
         return row["id"], row["taken_at"], _load_items(conn, row["id"]), row["raw_path"]
+
+
+def days_since_ok_snapshot(competitor_id: int) -> int | None:
+    """Сколько дней назад был последний УДАЧНЫЙ срез. None — удачных не было.
+
+    Нужно ручному режиму: Бургер Кинг обновляется, только когда шеф пришлёт
+    файл, и без этого счётчика забытый на три месяца конкурент выглядит
+    в сводке ровно так же, как присланный вчера.
+    """
+    with _connect() as conn:
+        row = conn.execute(
+            "SELECT taken_at FROM snapshots "
+            "WHERE competitor_id = ? AND status = 'ok' ORDER BY id DESC LIMIT 1",
+            (competitor_id,),
+        ).fetchone()
+    if row is None:
+        return None
+    try:
+        taken = datetime.fromisoformat(row["taken_at"])
+    except ValueError:
+        return None
+    return max((datetime.now() - taken).days, 0)
 
 
 def last_check_info(competitor_id: int) -> tuple[str, str] | None:

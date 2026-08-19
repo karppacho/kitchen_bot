@@ -41,6 +41,11 @@ class Settings(BaseSettings):
     ttk_director_position: str = "Генеральный директор"
     ttk_tr_ts_number: str = "021/2011"
 
+    # Генератор идей блюд (src/ideas/). Температура высокая — тут нужна
+    # вариативность, в отличие от техпроцесса ТТК (там 0.4, нужна аккуратность).
+    ideas_count: int = 3
+    ideas_temperature: float = 0.9
+
     # Расчётка для коммерческого отдела (src/pricing/)
     # Маржа ниже warn — жёлтая заливка; себестоимость выше цены — красная (это
     # почти всегда ошибка в данных). drop_pp — на сколько пунктов должна просесть
@@ -61,6 +66,14 @@ class Settings(BaseSettings):
     competitors_price_threshold_pct: float = 10.0
     competitors_price_threshold_rub: float = 30.0
     competitors_llm_model: str | None = None       # None → llm_model
+    # Постоянные профили браузера: там живут куки выбранного адреса (Лавка) и
+    # куки антибот-челленджа. Заводятся разово через scripts/browser_login.py.
+    competitors_browser_profiles_dir: str = "data/browser_profiles"
+    competitors_headless: bool = True              # False → видимое окно браузера
+    # fetch_method='cdp': бот подключается к УЖЕ ЗАПУЩЕННОМУ Chrome шефа.
+    # Ozon и Самокат детектируют любой автоматизированный браузер, даже
+    # настоящий Chrome со свежим профилем, — пускает только обжитой профиль.
+    competitors_cdp_url: str = "http://localhost:9222"
 
     model_config = SettingsConfigDict(
         env_file=".env",
