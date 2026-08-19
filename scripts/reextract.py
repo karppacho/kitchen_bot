@@ -64,8 +64,12 @@ def main() -> None:
     print(f"Файл: {path} ({len(text)} симв.), сайт: {site_name}\n")
 
     items, meta = extract_menu(text, site_name)
-    print(f"Позиций: {len(items)}; токенов: {meta.get('total_tokens')}; "
-          f"стоимость: {meta.get('cost_rub')} ₽\n")
+    print(f"Позиций: {len(items)}; чанков: {meta.chunks}; "
+          f"токенов: {meta.total_tokens}; стоимость: {meta.cost_rub} ₽")
+    suspicious = [i for i in items if i.price_rub and i.price_rub > 3000]
+    if suspicious:
+        print(f"ВНИМАНИЕ: цен выше 3000 руб: {len(suspicious)} — проверь копейки,"
+              f" «124.99» не должно превращаться в 12499")
     for item in items[: args.limit]:
         price = f"{item.price_rub:g} ₽" if item.price_rub is not None else "— цены нет"
         weight = f" [{item.weight}]" if item.weight else ""
