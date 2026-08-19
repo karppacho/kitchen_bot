@@ -74,6 +74,10 @@ class Settings(BaseSettings):
     # Ozon и Самокат детектируют любой автоматизированный браузер, даже
     # настоящий Chrome со свежим профилем, — пускает только обжитой профиль.
     competitors_cdp_url: str = "http://localhost:9222"
+    # Ночные отчёты (конкуренты, расчётка) копятся в очереди и уходят
+    # одной доставкой утром: считать удобно ночью, читать — нет.
+    reports_delivery_hour: int = 9
+    reports_delivery_minute: int = 0
 
     model_config = SettingsConfigDict(
         env_file=".env",

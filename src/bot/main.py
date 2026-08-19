@@ -33,6 +33,7 @@ from src.bot.keyboards import (
     COMPETITORS_KB,
     MAIN_KB,
 )
+from src.bot import reports
 from src.bot.telegram_text import split_for_telegram
 from src.competitors.service import run_check as run_competitors_check
 from src.data.sheets import get_data, reload_data
@@ -315,27 +316,41 @@ async def main():
     from apscheduler.triggers.cron import CronTrigger
 
     async def _weekly_competitors_check():
+        """Ночной прогон. Сводку НЕ шлём сразу — откладываем до утра."""
         try:
-            await run_competitors_check(bot, trigger="cron")
+            summary = await run_competitors_check(bot, trigger="cron", notify=False)
+            reports.queue_report(summary)
         except Exception:
             logger.exception("Еженедельная проверка конкурентов упала")
 
     async def _weekly_pricing_rebuild():
-        """Пересчёт расчётки. Сводка — всем разрешённым: это рассылка, как у
-        конкурентов. Смысл в том, чтобы не проглядеть подорожание сырья."""
+        """Пересчёт расчётки. Сводка тоже уходит в утреннюю доставку."""
         try:
             results = await pricing_service.rebuild()
         except Exception:
             logger.exception("Еженедельный пересчёт расчётки упал")
             return
-        text = format_pricing_result(results)
-        for user_id in settings.telegram_allowed_user_ids:
-            for chunk in split_for_telegram(text):
-                try:
-                    await bot.send_message(user_id, chunk)
-                except Exception as e:
-                    logger.warning(f"[расчётка] сводка не ушла {user_id}: {e}")
-                    break
+        reports.queue_report(format_pricing_result(results))
+
+    async def _deliver_reports():
+        """Утренняя доставка накопленного — всем разрешённым.
+
+        Задача ежедневная, хотя прогоны еженедельные: если ночной расчёт
+        затянулся или бот в это время лежал, отчёт уйдёт следующим утром,
+        а не потеряется до следующего понедельника.
+        """
+        texts = await asyncio.get_running_loop().run_in_executor(None, reports.pop_reports)
+        if not texts:
+            return
+        logger.info(f"[отчёты] утренняя доставка: {len(texts)} шт.")
+        for text in texts:
+            for user_id in settings.telegram_allowed_user_ids:
+                for chunk in split_for_telegram(text):
+                    try:
+                        await bot.send_message(user_id, chunk)
+                    except Exception as e:
+                        logger.warning(f"[отчёты] не ушло {user_id}: {e}")
+                        break
 
     scheduler = AsyncIOScheduler(timezone="Europe/Moscow")
     scheduler.add_job(
@@ -354,12 +369,21 @@ async def main():
             minute=settings.pricing_check_minute,
         ),
     )
+    scheduler.add_job(
+        _deliver_reports,
+        CronTrigger(
+            hour=settings.reports_delivery_hour,
+            minute=settings.reports_delivery_minute,
+        ),
+    )
     scheduler.start()
     logger.info(
         f"Мониторинг конкурентов: {settings.competitors_check_day} "
         f"{settings.competitors_check_hour:02d}:{settings.competitors_check_minute:02d} МСК; "
         f"расчётка: {settings.pricing_check_day} "
-        f"{settings.pricing_check_hour:02d}:{settings.pricing_check_minute:02d} МСК"
+        f"{settings.pricing_check_hour:02d}:{settings.pricing_check_minute:02d} МСК; "
+        f"доставка отчётов ежедневно в "
+        f"{settings.reports_delivery_hour:02d}:{settings.reports_delivery_minute:02d} МСК"
     )
 
     # Нативное меню Telegram (кнопка «Меню» слева от поля ввода). Не критично
