@@ -81,6 +81,13 @@ class SiteProfile:
     # почти нет — это не меню, каким бы длинным ни был текст.
     min_prices: int = DEFAULT_MIN_PRICES
 
+    # Сайт, который сам себя стирает: Самокат рендерит меню, а через секунду
+    # обнуляет тело страницы (проверено 19.08.2026: +1s — 20695 символов и
+    # 188 цен, +2s — ноль). Обычный сценарий (networkidle → клики → скролл)
+    # приходит уже к пустому. Если задано, снимаем кадры каждые 250 мс в
+    # течение стольких миллисекунд и берём самый богатый ценами.
+    capture_best_ms: int = 0
+
     # Меню разбито на подстраницы категорий: обходим их в той же сессии.
     category_selector: str | None = None
     max_pages: int = 14
@@ -138,8 +145,9 @@ PROFILES: dict[str, SiteProfile] = {
     # челлендж; пройденное руками через scripts/browser_login живёт в профиле.
     "samokat.ru": SiteProfile(
         use_profile=True,
-        scroll_mode="until_stable",
-        max_scrolls=40,
+        # Меню живёт на странице около секунды, потом Самокат обнуляет тело.
+        # Скроллить и ждать networkidle бессмысленно — берём лучший кадр.
+        capture_best_ms=6000,
         extra_urls=("https://samokat.ru/category/vsya-gotovaya-eda-13",),
     ),
     "vkusvill.ru": SiteProfile(

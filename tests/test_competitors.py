@@ -341,6 +341,14 @@ def test_classify_state_markers_win_over_length():
     assert profiles.classify_page(LAVKA_DEMO_TEXT)[0] == profiles.PAGE_EMPTY
 
 
+def test_samokat_captures_best_frame_not_final():
+    """Самокат обнуляет страницу через секунду — ждать нельзя, надо ловить кадр."""
+    sam = profiles.get_profile('samokat.ru')
+    assert sam.capture_best_ms > 0
+    # обычные сайты работают прежним сценарием
+    assert profiles.get_profile('dodopizza.ru').capture_best_ms == 0
+
+
 def test_default_profile_for_unknown_site():
     """Сайты вне реестра работают ровно как раньше."""
     assert profiles.get_profile("dodopizza.ru") is profiles.DEFAULT_PROFILE

@@ -15,6 +15,7 @@
 import asyncio
 import random
 import re
+import time
 from pathlib import Path
 
 from loguru import logger
@@ -23,6 +24,7 @@ from src.competitors.html_text import MAX_TEXT_CHARS, page_to_menu_text
 from src.competitors.models import Competitor, FetchResult
 from src.competitors.profiles import (
     PAGE_BLOCKED,
+    PRICE_MARKERS,
     PAGE_NEEDS_SESSION,
     PAGE_OK,
     SiteProfile,
@@ -119,8 +121,36 @@ async def _scroll(page, profile: SiteProfile) -> None:
         await asyncio.sleep(random.uniform(0.4, 0.9))
 
 
+async def _capture_best(page, url: str, profile: SiteProfile) -> str:
+    """Лучший кадр страницы, которая через секунду сама себя обнуляет.
+
+    Ждать тут нечего: к моменту networkidle меню уже стёрто. Снимаем кадры
+    подряд и оставляем тот, где больше всего цен, — это и есть отрендеренное
+    меню. Фиксированную задержку не берём: она хрупкая, а «самый богатый
+    кадр» переживает и ускорение, и замедление рендера.
+    """
+    await page.goto(url, wait_until="domcontentloaded", timeout=90_000)
+    best, best_prices = "", -1
+    deadline = time.monotonic() + profile.capture_best_ms / 1000
+    while time.monotonic() < deadline:
+        try:
+            text = page_to_menu_text(await page.content())
+        except Exception as e:
+            logger.debug(f"[конкуренты] кадр не снялся: {type(e).__name__}: {e}")
+            break
+        prices = sum(text.lower().count(m) for m in PRICE_MARKERS)
+        if prices > best_prices:
+            best, best_prices = text, prices
+        await asyncio.sleep(0.25)
+    logger.debug(f"[конкуренты] лучший кадр {url}: {len(best)} симв., цен {best_prices}")
+    return best
+
+
 async def _load_page_text(page, url: str, profile: SiteProfile, scrolls: int | None = None) -> str:
     """Открыть URL в существующей вкладке, отработать сценарий, снять чистый текст."""
+    if profile.capture_best_ms:
+        return await _capture_best(page, url, profile)
+
     await page.goto(url, wait_until="domcontentloaded", timeout=90_000)
     try:
         await page.wait_for_load_state("networkidle", timeout=15_000)

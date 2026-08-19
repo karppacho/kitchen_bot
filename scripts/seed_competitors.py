@@ -22,16 +22,16 @@ SEED = [
     # Именно cofix.global: на cofix.ru меню не отдаётся, запись по нему заархивирована
     ("Cofix", "cofix.global", "https://msk.cofix.global/", "playwright"),
     ("Яндекс Лавка", "lavka.yandex.ru",
-     "https://lavka.yandex.ru/catalog/technical/category/all_ready_meals", "http"),
+     "https://lavka.yandex.ru/catalog/technical/category/all_ready_meals", "cdp"),
     # Даркстор-конкуренты (август 2026).
     # ВкусВилл: обычный Playwright, но ТОЛЬКО с выключенным VPN — с туннелем
     # рвёт соединение (ERR_CONNECTION_CLOSED).
     # Самокат и Ozon: 'cdp' — детектируют любой автоматизированный браузер,
     # пускает только обжитой профиль (python -m scripts.chrome_debug).
     # Вторая категория Самоката — в extra_urls его профиля, не отдельной записью.
-    ("ВкусВилл", "vkusvill.ru", "https://vkusvill.ru/goods/kukhnya-vkusvill/", "playwright"),
+    ("ВкусВилл", "vkusvill.ru", "https://vkusvill.ru/goods/gotovaya-eda/", "cdp"),
     ("Самокат", "samokat.ru", "https://samokat.ru/category/vsyo-goryachee-1", "cdp"),
-    ("Ozon Hot&Fresh", "ozon.ru", "https://www.ozon.ru/brand/hot-fresh-101879249/", "cdp"),
+    ("Ozon Hot&Fresh", "ozon.ru", "https://www.ozon.ru/brand/hot-fresh-101879249/", "manual"),
 ]
 
 
